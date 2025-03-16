@@ -10,7 +10,7 @@ import random
 import os
 import metrics
 import Constants
-from seq2seq_model import Seq2SeqModel
+from seq2seq_model import ImprovedSeq2SeqModel
 from seq2seq_dataloader import Seq2SeqDataLoader
 from Optim import ScheduledOptim
 
@@ -147,10 +147,11 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
         src = batch['src'].to(device)
         tgt = batch['tgt'].to(device)
         src_lengths = batch['src_lengths'].to(device)
+        time_intervals = batch['time_intervals'].to(device)
         
         # 前向传播
         optimizer.zero_grad()
-        output = model(src, src_lengths, tgt)
+        output = model(src, src_lengths, tgt, time_intervals)
         
         # 计算损失
         loss, _ = get_performance(output, tgt, crit)
@@ -198,9 +199,10 @@ def evaluate(model, data_loader, crit, device, mode='valid', k_list=[10, 50, 100
             src = batch['src'].to(device)
             tgt = batch['tgt'].to(device)
             src_lengths = batch['src_lengths'].to(device)
+            time_intervals = batch['time_intervals'].to(device)
             
             # 前向传播
-            output = model(src, src_lengths, tgt)
+            output = model(src, src_lengths, tgt, time_intervals)
             
             # 计算损失
             loss, _ = get_performance(output, tgt, crit)
@@ -222,16 +224,7 @@ def evaluate(model, data_loader, crit, device, mode='valid', k_list=[10, 50, 100
     return avg_loss, metrics_dict
 
 def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_output_len=100):
-    """测试模型并计算评价指标
-    
-    参数:
-        model: 模型
-        data_loader: 数据加载器
-        device: 设备
-        k_list: 评价指标的k值列表
-        input_ratio: 输入序列占原始序列的比例
-        max_output_len: 最大输出序列长度
-    """
+    """测试模型并计算评价指标"""
     model.eval()
     
     all_preds = []
@@ -243,9 +236,10 @@ def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_
             src = batch['src'].to(device)
             tgt = batch['tgt'].to(device)
             src_lengths = batch['src_lengths'].to(device)
+            time_intervals = batch['time_intervals'].to(device)
             
             # 生成序列
-            generated_seq, generated_probs = model.generate(src, src_lengths, max_len=max_output_len)
+            generated_seq, generated_probs = model.generate(src, src_lengths, max_len=max_output_len, time_intervals=time_intervals)
             
             # 收集预测和目标
             for i in range(generated_seq.size(0)):
@@ -327,7 +321,9 @@ def main():
     # 模型参数
     parser.add_argument('--embed_dim', type=int, default=64, help='嵌入维度')
     parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
-    parser.add_argument('--n_layers', type=int, default=2, help='LSTM层数')
+    parser.add_argument('--n_layers', type=int, default=2, help='Transformer层数')
+    parser.add_argument('--n_heads', type=int, default=8, help='注意力头数')
+    parser.add_argument('--pf_dim', type=int, default=512, help='前馈网络维度')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout比例')
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5, help='教师强制比例')
     
@@ -343,10 +339,9 @@ def main():
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='模型保存目录')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--results_file', type=str, default='results.txt', help='结果保存文件')
-    
-    # 测试参数
     parser.add_argument('--input_ratio', type=float, default=0.5, help='测试时输入序列占原始序列的比例')
     parser.add_argument('--max_output_len', type=int, default=100, help='测试时最大输出序列长度')
+    parser.add_argument('--max_seq_length', type=int, default=1000, help='最大序列长度')
     
     args = parser.parse_args()
     
@@ -374,16 +369,19 @@ def main():
     
     # 创建模型并移动到设备
     print("创建模型...")
-    model = Seq2SeqModel(
+    model = ImprovedSeq2SeqModel(
         user_size=data_loader.user_size,
         embed_dim=args.embed_dim,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        pf_dim=args.pf_dim,
         dropout=args.dropout,
         use_network=args.use_network,
         adj=data_loader.adj_tensor.to(device) if args.use_network and data_loader.adj_tensor is not None else None,
         net_dict=data_loader.adj_dict if args.use_network else None,
-        teacher_forcing_ratio=args.teacher_forcing_ratio
+        teacher_forcing_ratio=args.teacher_forcing_ratio,
+        max_seq_length=args.max_seq_length
     ).to(device)
     
     # 如果有预训练嵌入，加载它们
@@ -411,7 +409,8 @@ def main():
     print(f"批次大小: {args.batch_size}")
     print(f"嵌入维度: {args.embed_dim}")
     print(f"隐藏层维度: {args.hidden_dim}")
-    print(f"LSTM层数: {args.n_layers}")
+    print(f"Transformer层数: {args.n_layers}")
+    print(f"注意力头数: {args.n_heads}")
     print(f"Dropout比例: {args.dropout}")
     print(f"使用社交网络: {args.use_network}")
     print(f"输入序列比例: {args.split_ratio}")
@@ -424,7 +423,8 @@ def main():
         f.write(f"批次大小: {args.batch_size}\n")
         f.write(f"嵌入维度: {args.embed_dim}\n")
         f.write(f"隐藏层维度: {args.hidden_dim}\n")
-        f.write(f"LSTM层数: {args.n_layers}\n")
+        f.write(f"Transformer层数: {args.n_layers}\n")
+        f.write(f"注意力头数: {args.n_heads}\n")
         f.write(f"Dropout比例: {args.dropout}\n")
         f.write(f"使用社交网络: {args.use_network}\n")
         f.write(f"设备: {device}\n\n")
