@@ -117,7 +117,7 @@ class GraphAttentionLayer(nn.Module):
         
         return h_prime
 
-# 简化的多头注意力，减少内存使用
+# 修复的多头注意力，解决维度不匹配问题
 class MultiHeadAttention(nn.Module):
     """多头注意力机制"""
     def __init__(self, hidden_dim, n_heads, dropout=0.1):
@@ -129,8 +129,11 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = hidden_dim // n_heads
         
-        # 使用单个线性层减少参数量
-        self.fc_qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
+        # 分别为Q, K, V创建线性层
+        self.fc_q = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_k = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_v = nn.Linear(hidden_dim, hidden_dim)
+        
         self.fc_o = nn.Linear(hidden_dim, hidden_dim)
         
         self.dropout = nn.Dropout(dropout)
@@ -140,29 +143,45 @@ class MultiHeadAttention(nn.Module):
     def forward(self, query, key, value, mask=None):
         batch_size = query.shape[0]
         
-        # 单次线性变换获取Q, K, V
-        qkv = self.fc_qkv(query)
-        q, k, v = qkv.chunk(3, dim=-1)
+        # 线性变换
+        Q = self.fc_q(query)  # [batch_size, query_len, hidden_dim]
+        K = self.fc_k(key)    # [batch_size, key_len, hidden_dim]
+        V = self.fc_v(value)  # [batch_size, value_len, hidden_dim]
         
         # 分离头
-        q = q.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = k.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = v.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        Q = Q.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)  # [batch_size, n_heads, query_len, head_dim]
+        K = K.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)  # [batch_size, n_heads, key_len, head_dim]
+        V = V.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)  # [batch_size, n_heads, value_len, head_dim]
+        
+        # 确保设备一致
+        if hasattr(self, 'scale') and isinstance(self.scale, torch.Tensor):
+            self.scale = self.scale.to(query.device)
+        else:
+            self.scale = torch.sqrt(torch.FloatTensor([self.head_dim])).to(query.device)
         
         # 缩放点积注意力
-        energy = torch.matmul(q, k.permute(0, 1, 3, 2)) / self.scale.to(q.device)
+        energy = torch.matmul(Q, K.permute(0, 1, 3, 2)) / self.scale  # [batch_size, n_heads, query_len, key_len]
         
+        # 应用掩码（如果有）
         if mask is not None:
-            energy = energy.masked_fill(mask.unsqueeze(1).unsqueeze(1) == 0, -1e10)
+            # 调整掩码维度以匹配energy
+            if mask.dim() == 2:  # [batch_size, seq_len]
+                mask = mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+            energy = energy.masked_fill(mask == 0, -1e10)
         
-        attention = F.softmax(energy, dim=-1)
+        # 注意力权重
+        attention = F.softmax(energy, dim=-1)  # [batch_size, n_heads, query_len, key_len]
         attention = self.dropout(attention)
         
-        x = torch.matmul(attention, v)
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(batch_size, -1, self.hidden_dim)
+        # 应用注意力权重
+        x = torch.matmul(attention, V)  # [batch_size, n_heads, query_len, head_dim]
         
-        x = self.fc_o(x)
+        # 合并头
+        x = x.permute(0, 2, 1, 3).contiguous()  # [batch_size, query_len, n_heads, head_dim]
+        x = x.view(batch_size, -1, self.hidden_dim)  # [batch_size, query_len, hidden_dim]
+        
+        # 最终线性层
+        x = self.fc_o(x)  # [batch_size, query_len, hidden_dim]
         
         return x
 
