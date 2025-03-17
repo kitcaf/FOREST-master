@@ -5,6 +5,7 @@ from torch.autograd import Variable
 import Constants
 import pickle
 import scipy.sparse as sp
+import gc
 
 from seq2seq_model import normalize, sparse_mx_to_torch_sparse_tensor
 
@@ -18,7 +19,7 @@ from seq2seq_model import normalize, sparse_mx_to_torch_sparse_tensor
 class Seq2SeqDataLoader:
     """序列到序列数据加载器"""
     
-    def __init__(self, data_name, split_ratio=0.5, batch_size=32, cuda=True, shuffle=True, loadNE=True):
+    def __init__(self, data_name, split_ratio=0.5, batch_size=32, cuda=True, shuffle=True, loadNE=True, max_seq_length=500):
         """
         初始化数据加载器
         
@@ -29,12 +30,14 @@ class Seq2SeqDataLoader:
             cuda: 是否使用CUDA
             shuffle: 是否打乱数据
             loadNE: 是否加载网络嵌入
+            max_seq_length: 最大序列长度
         """
         self.data_name = data_name
         self.split_ratio = split_ratio
         self.batch_size = batch_size
         self.cuda = cuda
         self.shuffle = shuffle
+        self.max_seq_length = max_seq_length
         
         # 文件路径
         self.train_data_path = f'data/{data_name}/cascade.txt'
@@ -43,7 +46,7 @@ class Seq2SeqDataLoader:
         self.u2idx_dict_path = f'data/{data_name}/u2idx.pickle'
         self.idx2u_dict_path = f'data/{data_name}/idx2u.pickle'
         self.net_data_path = f'data/{data_name}/edges.txt'
-        self.embed_dim = 64
+        self.embed_dim = 32  # 减小嵌入维度
         self.embed_file_path = f'data/{data_name}/dw{self.embed_dim}.txt'
         
         # 加载用户索引
@@ -146,8 +149,11 @@ class Seq2SeqDataLoader:
         print(f"验证集大小: {len(self.valid_cascades)}")
         print(f"测试集大小: {len(self.test_cascades)}")
     
-    def _read_cascades(self, file_path, max_len=500):
-        """读取级联数据，包括时间戳"""
+    def _read_cascades(self, file_path, max_len=None):
+        """读取级联数据，包括时间戳，限制最大长度"""
+        if max_len is None:
+            max_len = self.max_seq_length
+            
         cascades = []
         timestamps = []
         
@@ -168,31 +174,31 @@ class Seq2SeqDataLoader:
                         timelist.append(timestamp)
             
             # 只保留长度大于2且小于max_len的级联
-            if len(userlist) > 2 and len(userlist) <= max_len:
+            if 2 < len(userlist) <= max_len:
                 cascades.append(userlist)
                 timestamps.append(timelist)
         
         return cascades, timestamps
     
-    def _calculate_time_intervals(self, timestamps):
+    def _calculate_time_intervals(self, timestamps_list):
         """计算时间间隔"""
-        intervals = []
-        for times in timestamps:
-            if len(times) <= 1:
-                intervals.append([0.0])
-                continue
-                
-            # 计算相邻时间戳之间的间隔
-            cascade_intervals = [0.0]  # 第一个元素的间隔为0
-            for i in range(1, len(times)):
-                interval = times[i] - times[i-1]
-                # 归一化间隔，避免数值过大
-                normalized_interval = np.log1p(interval) / 10.0  # 取对数并缩放
-                cascade_intervals.append(normalized_interval)
-            
-            intervals.append(cascade_intervals)
+        intervals_list = []
         
-        return intervals
+        for timestamps in timestamps_list:
+            if len(timestamps) <= 1:
+                intervals = [0.0]
+            else:
+                # 计算相邻时间戳之间的间隔
+                intervals = [0.0]  # 第一个时间戳的间隔为0
+                for i in range(1, len(timestamps)):
+                    interval = timestamps[i] - timestamps[i-1]
+                    # 归一化时间间隔，避免数值过大
+                    interval = min(interval, 86400) / 86400  # 限制最大为1天，并归一化
+                    intervals.append(interval)
+            
+            intervals_list.append(intervals)
+        
+        return intervals_list
     
     def _load_network_data(self):
         """加载社交网络数据"""
@@ -315,13 +321,13 @@ class Seq2SeqDataLoader:
         return batches
     
     def _prepare_seq2seq_batch(self, cascades, intervals, split_ratio=None):
-        """准备序列到序列批次"""
+        """准备序列到序列批次，使用半精度浮点数减少内存使用"""
         # 使用传入的分割比例或默认值
         if split_ratio is None:
             split_ratio = self.split_ratio
         
         # 找到最长的级联
-        max_len = max(len(c) for c in cascades)
+        max_len = min(max(len(c) for c in cascades), self.max_seq_length)
         
         # 创建源序列和目标序列
         src_seqs = []
@@ -330,6 +336,11 @@ class Seq2SeqDataLoader:
         src_intervals = []
         
         for cascade, interval in zip(cascades, intervals):
+            # 截断过长的序列
+            if len(cascade) > self.max_seq_length:
+                cascade = cascade[:self.max_seq_length]
+                interval = interval[:self.max_seq_length]
+                
             # 计算分割点
             split_point = max(2, int(len(cascade) * split_ratio))
             
@@ -357,6 +368,9 @@ class Seq2SeqDataLoader:
         tgt_tensor = torch.LongTensor(tgt_seqs)
         src_lengths_tensor = torch.LongTensor(src_lengths)
         src_intervals_tensor = torch.FloatTensor(src_intervals)
+        
+        # 使用半精度浮点数减少内存使用
+        src_intervals_tensor = src_intervals_tensor.half().float()
         
         if self.cuda:
             src_tensor = src_tensor.cuda()

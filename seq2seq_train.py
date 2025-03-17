@@ -13,6 +13,10 @@ import Constants
 from seq2seq_model import ImprovedSeq2SeqModel
 from seq2seq_dataloader import Seq2SeqDataLoader
 from Optim import ScheduledOptim
+import gc
+
+# 设置PyTorch内存分配器
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
 
 def set_seed(seed):
     """设置随机种子以确保可重复性"""
@@ -133,8 +137,8 @@ def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
     
     return scores
 
-def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100]):
-    """训练一个epoch"""
+def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100], gradient_accumulation_steps=4):
+    """训练一个epoch，使用梯度累积减少内存使用"""
     model.train()
     
     total_loss = 0
@@ -142,7 +146,9 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
     epoch_metrics = {f'hits@{k}': 0.0 for k in k_list}
     epoch_metrics.update({f'map@{k}': 0.0 for k in k_list})
     
-    for batch in tqdm(data_loader.get_train_batches(), desc="Training"):
+    optimizer.zero_grad()  # 初始化梯度
+    
+    for batch_idx, batch in enumerate(tqdm(data_loader.get_train_batches(), desc="Training")):
         # 获取数据并移动到正确的设备
         src = batch['src'].to(device)
         tgt = batch['tgt'].to(device)
@@ -150,31 +156,49 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
         time_intervals = batch['time_intervals'].to(device)
         
         # 前向传播
-        optimizer.zero_grad()
         output = model(src, src_lengths, tgt, time_intervals)
         
         # 计算损失
         loss, _ = get_performance(output, tgt, crit)
+        loss = loss / gradient_accumulation_steps  # 缩放损失
         
         # 反向传播
         loss.backward()
-        
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        # 更新参数
-        optimizer.step()
-        optimizer.update_learning_rate()
         
         # 计算指标
         batch_metrics = calculate_metrics(output, tgt, k_list)
         
         # 记录指标
-        total_loss += loss.item()
+        total_loss += loss.item() * gradient_accumulation_steps  # 恢复原始损失值
         n_batches += 1
         for k in k_list:
             epoch_metrics[f'hits@{k}'] += batch_metrics[f'hits@{k}']
             epoch_metrics[f'map@{k}'] += batch_metrics[f'map@{k}']
+        
+        # 清除不需要的变量以节省内存
+        del src, tgt, src_lengths, time_intervals, output
+        torch.cuda.empty_cache()
+        
+        # 梯度累积：每处理N个批次才更新一次参数
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            # 更新参数
+            optimizer.step()
+            optimizer.update_learning_rate()
+            optimizer.zero_grad()
+            
+            # 强制垃圾回收
+            gc.collect()
+            torch.cuda.empty_cache()
+    
+    # 处理最后一批次（如果有）
+    if (batch_idx + 1) % gradient_accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.update_learning_rate()
+        optimizer.zero_grad()
     
     # 计算平均值
     for k in k_list:
@@ -215,6 +239,10 @@ def evaluate(model, data_loader, crit, device, mode='valid', k_list=[10, 50, 100
             for k, v in batch_metrics.items():
                 metrics_dict[k] += v
             n_batches += 1
+            
+            # 清除不需要的变量以节省内存
+            del src, tgt, src_lengths, time_intervals, output
+            torch.cuda.empty_cache()
     
     # 计算平均值
     avg_loss = total_loss / n_batches
@@ -267,6 +295,10 @@ def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_
                 
                 all_targets.append(target_set)
                 all_preds.append(pred_list)
+            
+            # 清除不需要的变量以节省内存
+            del src, tgt, src_lengths, time_intervals, generated_seq, generated_probs
+            torch.cuda.empty_cache()
     
     # 计算评价指标
     scores = {}
@@ -315,15 +347,15 @@ def main():
     
     # 数据参数
     parser.add_argument('--data_name', type=str, default='twitter', help='数据集名称')
-    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--batch_size', type=int, default=8, help='批次大小')  # 减小批次大小
     parser.add_argument('--split_ratio', type=float, default=0.5, help='输入序列与目标序列的分割比例')
     
     # 模型参数
-    parser.add_argument('--embed_dim', type=int, default=64, help='嵌入维度')
-    parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
-    parser.add_argument('--n_layers', type=int, default=2, help='Transformer层数')
-    parser.add_argument('--n_heads', type=int, default=8, help='注意力头数')
-    parser.add_argument('--pf_dim', type=int, default=512, help='前馈网络维度')
+    parser.add_argument('--embed_dim', type=int, default=32, help='嵌入维度')  # 减小嵌入维度
+    parser.add_argument('--hidden_dim', type=int, default=64, help='隐藏层维度')  # 减小隐藏层维度
+    parser.add_argument('--n_layers', type=int, default=1, help='Transformer层数')  # 减少层数
+    parser.add_argument('--n_heads', type=int, default=4, help='注意力头数')  # 减少头数
+    parser.add_argument('--pf_dim', type=int, default=256, help='前馈网络维度')  # 减小前馈网络维度
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout比例')
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5, help='教师强制比例')
     
@@ -332,6 +364,7 @@ def main():
     parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     parser.add_argument('--n_warmup_steps', type=int, default=4000, help='预热步数')
     parser.add_argument('--k_list', type=int, nargs='+', default=[10, 50, 100], help='评价指标的k值列表')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=4, help='梯度累积步数')
     
     # 其他参数
     parser.add_argument('--no_cuda', action='store_true', help='不使用CUDA')
@@ -339,9 +372,9 @@ def main():
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='模型保存目录')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--results_file', type=str, default='results.txt', help='结果保存文件')
-    parser.add_argument('--input_ratio', type=float, default=0.5, help='测试时输入序列占原始序列的比例')
+    parser.add_argument('--input_ratio', type=float, default=0.6, help='测试时输入序列占原始序列的比例')
     parser.add_argument('--max_output_len', type=int, default=100, help='测试时最大输出序列长度')
-    parser.add_argument('--max_seq_length', type=int, default=1000, help='最大序列长度')
+    parser.add_argument('--max_seq_length', type=int, default=500, help='最大序列长度')  # 减小最大序列长度
     
     args = parser.parse_args()
     
@@ -414,6 +447,7 @@ def main():
     print(f"Dropout比例: {args.dropout}")
     print(f"使用社交网络: {args.use_network}")
     print(f"输入序列比例: {args.split_ratio}")
+    print(f"梯度累积步数: {args.gradient_accumulation_steps}")
     print(f"设备: {device}")
 
     # 记录训练配置
@@ -427,6 +461,7 @@ def main():
         f.write(f"注意力头数: {args.n_heads}\n")
         f.write(f"Dropout比例: {args.dropout}\n")
         f.write(f"使用社交网络: {args.use_network}\n")
+        f.write(f"梯度累积步数: {args.gradient_accumulation_steps}\n")
         f.write(f"设备: {device}\n\n")
     
     for epoch in range(args.n_epochs):
@@ -434,13 +469,24 @@ def main():
         
         # 训练
         start_time = time.time()
-        train_loss, train_metrics = train_epoch(model, data_loader, optimizer, crit, device, args.k_list)
+        train_loss, train_metrics = train_epoch(
+            model, data_loader, optimizer, crit, device, 
+            args.k_list, args.gradient_accumulation_steps
+        )
         train_time = time.time() - start_time
+        
+        # 清理内存
+        gc.collect()
+        torch.cuda.empty_cache()
         
         # 验证
         start_time = time.time()
         valid_loss, valid_metrics = evaluate(model, data_loader, crit, device, mode='valid', k_list=args.k_list)
         valid_time = time.time() - start_time
+        
+        # 清理内存
+        gc.collect()
+        torch.cuda.empty_cache()
         
         # 打印结果
         print(f"Train Loss: {train_loss:.4f} | Time: {train_time:.2f}s")
@@ -492,6 +538,10 @@ def main():
                 for metric, value in scores.items():
                     f.write(f"{metric}: {value:.4f}\n")
                 f.write("\n")
+            
+            # 清理内存
+            gc.collect()
+            torch.cuda.empty_cache()
     
     # 加载最佳模型进行最终测试
     print("加载最佳模型进行最终测试...")
