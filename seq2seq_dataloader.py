@@ -39,6 +39,9 @@ class Seq2SeqDataLoader:
         self.shuffle = shuffle
         self.max_seq_length = max_seq_length
         
+        # 打印CUDA设置
+        print(f"数据加载器CUDA设置: {self.cuda}")
+        
         # 文件路径
         self.train_data_path = f'data/{data_name}/cascade.txt'
         self.valid_data_path = f'data/{data_name}/cascadevalid.txt'
@@ -350,10 +353,16 @@ class Seq2SeqDataLoader:
             
             # 创建源序列和目标序列
             src = cascade[:split_point]
+            
+            # 限制源序列长度，防止过长
+            if len(src) > self.max_seq_length:
+                src = src[-self.max_seq_length:]  # 只保留最后max_seq_length个节点
+                interval = interval[-self.max_seq_length:]  # 相应地调整时间间隔
+            
             tgt = [Constants.BOS] + cascade[split_point:] + [Constants.EOS]  # 最后3个节点加上BOS和EOS
             
             # 获取源序列的时间间隔
-            src_interval = interval[:split_point]
+            src_interval = interval[:len(src)]
             
             # 记录源序列长度
             src_lengths.append(len(src))
