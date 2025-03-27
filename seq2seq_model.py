@@ -36,7 +36,7 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
 
 class PositionalEncoding(nn.Module):
     """位置编码模块"""
-    def __init__(self, d_model, max_seq_length=500, dropout=0.1):
+    def __init__(self, d_model, max_seq_length=3000, dropout=0.1):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         
@@ -54,6 +54,12 @@ class PositionalEncoding(nn.Module):
         
     def forward(self, x):
         # x: [batch_size, seq_len, d_model]
+        seq_len = x.size(1)
+        if seq_len > self.pe.size(1):
+            # 如果序列长度超过预定义的最大长度，截断序列
+            x = x[:, :self.pe.size(1), :]
+            print(f"警告：序列长度 {seq_len} 超过位置编码最大长度 {self.pe.size(1)}，已截断")
+        
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 
@@ -287,6 +293,7 @@ class Encoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_network = use_network
         self.adj = adj
+        self.net_dict = net_dict
         
         # 用户嵌入
         self.user_embedding = nn.Embedding(user_size, embed_dim, padding_idx=Constants.PAD)
@@ -297,11 +304,9 @@ class Encoder(nn.Module):
         # 时间间隔编码
         self.time_encoder = TimeIntervalEncoding(embed_dim, dropout)
         
-        # 图注意力网络
-        if use_network and adj is not None:
-            self.gat = GraphAttentionLayer(embed_dim, embed_dim, dropout=dropout)
-            # 添加第二层GAT以捕获更复杂的图结构
-            self.gat2 = GraphAttentionLayer(embed_dim, embed_dim, dropout=dropout)
+        # 替换为邻域聚合方法
+        if use_network and net_dict is not None:
+            self.social_module = NeighborAggregation(embed_dim, aggregation='mean', max_neighbors=15)
         
         # 投影层，将嵌入维度映射到隐藏维度
         self.input_projection = nn.Linear(embed_dim, hidden_dim)
@@ -334,25 +339,33 @@ class Encoder(nn.Module):
         if time_intervals is not None:
             embedded = self.time_encoder(embedded, time_intervals)
         
-        # 应用图注意力网络（如果使用社交网络）
-        if self.use_network and self.adj is not None:
-            # 保存原始嵌入
-            original_shape = embedded.shape
-            
-            # 重塑为[batch_size * src_len, embed_dim]以应用GAT
-            flat_embedded = embedded.view(-1, self.embed_dim)
-            
-            # 应用第一层GAT
-            gat_output = self.gat(flat_embedded, self.adj)
-            
-            # 应用第二层GAT以捕获更复杂的图结构
-            gat_output = self.gat2(gat_output, self.adj)
-            
-            # 重塑回原始形状
-            gat_output = gat_output.view(original_shape)
-            
-            # 残差连接
-            embedded = embedded + gat_output
+        # 应用邻域聚合（如果使用社交网络）
+        if self.use_network and hasattr(self, 'social_module') and self.net_dict is not None:
+            try:
+                # 对于其他基于图的方法
+                batch_size, seq_len, _ = embedded.shape
+                flat_embedded = embedded.view(-1, self.embed_dim)
+                
+                # 获取当前批次中的用户ID
+                flat_src = src.view(-1)
+                valid_mask = (flat_src != Constants.PAD)
+                valid_indices = valid_mask.nonzero().squeeze(-1)
+                
+                if len(valid_indices) > 0:  # 确保有有效索引
+                    # 应用邻域聚合
+                    social_output = self.social_module(flat_embedded, self.net_dict)
+                    
+                    # 重塑回原始形状
+                    social_embedded = torch.zeros_like(flat_embedded)
+                    social_embedded[valid_indices] = social_output[valid_indices]
+                    social_embedded = social_embedded.view(batch_size, seq_len, -1)
+                    
+                    # 融合 - 使用较小的权重以减少不稳定性
+                    embedded = embedded + 0.2 * social_embedded
+            except Exception as e:
+                print(f"应用邻域聚合时出现异常: {e}")
+                # 出现异常时保持原始嵌入不变
+                pass
         
         # 投影到隐藏维度
         src = self.input_projection(embedded)  # [batch_size, src_len, hidden_dim]
@@ -427,6 +440,162 @@ class Decoder(nn.Module):
         
         return output
 
+class NeighborAggregation(nn.Module):
+    """基于邻域的特征聚合模块，增强稳定性"""
+    def __init__(self, embed_dim, aggregation='mean', max_neighbors=15):
+        super(NeighborAggregation, self).__init__()
+        self.embed_dim = embed_dim
+        self.aggregation = aggregation
+        self.max_neighbors = max_neighbors
+        
+        # 转换层
+        self.transform = nn.Linear(embed_dim, embed_dim)
+        self.activation = nn.ReLU()
+        
+        # 添加层归一化以提高稳定性
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        
+    def forward(self, node_features, adj_dict):
+        """
+        node_features: 节点特征 [N, embed_dim]
+        adj_dict: 邻接字典 {node_id: [neighbor_ids]}
+        """
+        N = node_features.size(0)
+        output_features = node_features.clone()  # 使用克隆而不是零初始化
+        
+        for i in range(N):
+            # 获取当前节点的特征
+            current_feat = node_features[i]
+            
+            try:
+                # 获取邻居节点
+                if i in adj_dict and adj_dict[i]:
+                    # 限制邻居数量
+                    neighbors = adj_dict[i][:self.max_neighbors]
+                    
+                    # 确保邻居索引有效
+                    valid_neighbors = [n for n in neighbors if n < N]
+                    
+                    if valid_neighbors:
+                        neighbor_feats = node_features[valid_neighbors]
+                        
+                        # 聚合邻居特征
+                        if self.aggregation == 'mean':
+                            agg_feat = torch.mean(neighbor_feats, dim=0)
+                        elif self.aggregation == 'max':
+                            agg_feat = torch.max(neighbor_feats, dim=0)[0]
+                        elif self.aggregation == 'sum':
+                            agg_feat = torch.sum(neighbor_feats, dim=0)
+                        else:
+                            agg_feat = torch.mean(neighbor_feats, dim=0)
+                        
+                        # 检查聚合特征是否包含NaN
+                        if torch.isnan(agg_feat).any():
+                            print(f"警告：节点{i}的邻域聚合特征包含NaN，使用原始特征")
+                            continue
+                        
+                        # 组合当前节点和邻居特征
+                        transformed = self.transform(agg_feat)
+                        combined_feat = current_feat + transformed
+                        
+                        # 应用层归一化
+                        combined_feat = self.layer_norm(combined_feat)
+                        
+                        # 应用激活函数
+                        output_features[i] = self.activation(combined_feat)
+                    else:
+                        # 没有有效邻居，保持原特征
+                        output_features[i] = current_feat
+                else:
+                    # 没有邻居，保持原特征
+                    output_features[i] = current_feat
+            except Exception as e:
+                print(f"处理节点{i}时出现异常: {e}")
+                # 出现异常时保持原特征
+                output_features[i] = current_feat
+        
+        return output_features
+
+class SubgraphConvolution(nn.Module):
+    """基于子图的卷积模块"""
+    def __init__(self, embed_dim, hops=1):
+        super(SubgraphConvolution, self).__init__()
+        self.embed_dim = embed_dim
+        self.hops = hops
+        
+        # 定义每一跳的转换
+        self.transforms = nn.ModuleList([
+            nn.Linear(embed_dim, embed_dim) for _ in range(hops)
+        ])
+        
+    def forward(self, node_features, adj_dict, node_indices):
+        """
+        node_features: 所有节点特征 [N, embed_dim]
+        adj_dict: 邻接字典 {node_id: [neighbor_ids]}
+        node_indices: 当前批次中的节点索引 [batch_size]
+        """
+        batch_size = len(node_indices)
+        output_features = node_features.clone()
+        
+        # 为每个节点收集k跳邻居
+        for node_idx in node_indices:
+            # 初始化当前节点的特征
+            current_feat = node_features[node_idx]
+            
+            # 收集k跳邻居
+            neighbors = {0: [node_idx]}
+            for h in range(1, self.hops + 1):
+                neighbors[h] = []
+                for prev_node in neighbors[h-1]:
+                    if prev_node in adj_dict:
+                        neighbors[h].extend(adj_dict[prev_node])
+                # 去重
+                neighbors[h] = list(set(neighbors[h]))
+            
+            # 从最远的跳数开始聚合
+            for h in range(self.hops, 0, -1):
+                # 聚合当前跳数的邻居
+                if neighbors[h]:
+                    neighbor_feats = node_features[neighbors[h]]
+                    agg_feat = torch.mean(neighbor_feats, dim=0)
+                    
+                    # 应用转换
+                    transformed = self.transforms[h-1](agg_feat)
+                    
+                    # 更新前一跳的节点特征
+                    for prev_node in neighbors[h-1]:
+                        output_features[prev_node] = output_features[prev_node] + transformed
+        
+        return output_features[node_indices]
+
+class SocialEmbedding(nn.Module):
+    """预计算的社交嵌入模块"""
+    def __init__(self, user_size, embed_dim):
+        super(SocialEmbedding, self).__init__()
+        self.user_size = user_size
+        self.embed_dim = embed_dim
+        
+        # 社交关系嵌入
+        self.social_embedding = nn.Embedding(user_size, embed_dim)
+        
+        # 融合层
+        self.fusion = nn.Linear(embed_dim * 2, embed_dim)
+        self.activation = nn.ReLU()
+        
+    def forward(self, user_embeds, user_ids):
+        """
+        user_embeds: 用户基础嵌入 [batch_size, seq_len, embed_dim]
+        user_ids: 用户ID [batch_size, seq_len]
+        """
+        # 获取社交嵌入
+        social_embeds = self.social_embedding(user_ids)  # [batch_size, seq_len, embed_dim]
+        
+        # 融合基础嵌入和社交嵌入
+        combined = torch.cat([user_embeds, social_embeds], dim=-1)  # [batch_size, seq_len, embed_dim*2]
+        fused = self.fusion(combined)  # [batch_size, seq_len, embed_dim]
+        
+        return self.activation(fused)
+
 class ImprovedSeq2SeqModel(nn.Module):
     """改进的序列到序列模型"""
     def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, n_heads=8, pf_dim=512, dropout=0.1, 
@@ -436,6 +605,11 @@ class ImprovedSeq2SeqModel(nn.Module):
         # 确保adj是稀疏张量
         if adj is not None and not isinstance(adj, torch.sparse.FloatTensor):
             print("警告：邻接矩阵不是稀疏张量，性能可能受影响")
+        
+        # 确保net_dict是字典
+        if net_dict is not None and not isinstance(net_dict, dict):
+            print("警告：网络字典不是字典类型，将被忽略")
+            net_dict = None
         
         self.encoder = Encoder(
             user_size, embed_dim, hidden_dim, n_layers, n_heads, pf_dim, dropout, 
@@ -469,6 +643,11 @@ class ImprovedSeq2SeqModel(nn.Module):
         # 编码
         enc_src, _ = self.encoder(src, src_lengths, time_intervals)  # [batch_size, src_len, hidden_dim]
         
+        # 检查编码器输出是否包含NaN
+        if torch.isnan(enc_src).any():
+            print("警告：编码器输出包含NaN，正在应用修复...")
+            enc_src = torch.nan_to_num(enc_src, nan=0.0)
+        
         # 存储预测结果
         outputs = torch.zeros(batch_size, tgt_len, self.user_size).to(src.device)
         
@@ -479,6 +658,11 @@ class ImprovedSeq2SeqModel(nn.Module):
         for t in range(1, tgt_len):
             # 解码一步
             output = self.decoder(decoder_input, enc_src, src_mask)  # [batch_size, t, user_size]
+            
+            # 检查解码器输出是否包含NaN
+            if torch.isnan(output).any():
+                print(f"警告：解码器在步骤{t}输出包含NaN，正在应用修复...")
+                output = torch.nan_to_num(output, nan=0.0)
             
             # 存储当前步的预测
             outputs[:, t, :] = output[:, -1, :]
@@ -493,7 +677,7 @@ class ImprovedSeq2SeqModel(nn.Module):
                 decoder_input = torch.cat([decoder_input, tgt[:, t].unsqueeze(1)], dim=1)
             else:
                 decoder_input = torch.cat([decoder_input, top1], dim=1)
-            
+        
         return outputs
     
     def generate(self, src, src_lengths, max_len=3, time_intervals=None, start_tokens=None):

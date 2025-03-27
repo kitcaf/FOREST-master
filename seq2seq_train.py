@@ -60,10 +60,15 @@ def set_loss(pred, gold):
     return loss / batch_size
 
 def get_performance(pred, gold, crit):
-    """计算性能指标，使用组合损失"""
+    """计算性能指标，使用组合损失，增加数值稳定性"""
     # 调整预测和目标形状
     pred_flat = pred.view(-1, pred.size(-1))  # [batch_size*tgt_len, user_size]
     gold_flat = gold.contiguous().view(-1)    # [batch_size*tgt_len]
+    
+    # 检查预测值是否包含NaN
+    if torch.isnan(pred_flat).any():
+        print("警告：预测值包含NaN，正在应用修复...")
+        pred_flat = torch.nan_to_num(pred_flat, nan=0.0, posinf=1e6, neginf=-1e6)
     
     # 计算交叉熵损失
     ce_loss = crit(pred_flat, gold_flat)
@@ -73,6 +78,11 @@ def get_performance(pred, gold, crit):
     
     # 组合损失
     combined_loss = ce_loss + set_loss_val
+    
+    # 检查损失是否为NaN
+    if torch.isnan(combined_loss):
+        print("警告：损失为NaN，使用仅交叉熵损失...")
+        return ce_loss, ce_loss
     
     return combined_loss, ce_loss
 
@@ -129,6 +139,9 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
     """训练一个epoch，使用梯度累积减少内存使用"""
     model.train()
     
+    # 打印设备信息
+    print(f"训练设备: {device}")
+    
     total_loss = 0
     n_batches = 0
     epoch_metrics = {f'hits@{k}': 0.0 for k in k_list}
@@ -142,6 +155,10 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
         tgt = batch['tgt'].to(device)
         src_lengths = batch['src_lengths'].to(device)
         time_intervals = batch['time_intervals'].to(device)
+        
+        # 检查数据是否在GPU上
+        if batch_idx == 0:
+            print(f"数据是否在GPU上: {src.is_cuda}")
         
         # 前向传播
         output = model(src, src_lengths, tgt, time_intervals)
@@ -170,7 +187,7 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
         # 梯度累积：每处理N个批次才更新一次参数
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
             # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             
             # 更新参数
             optimizer.step()
@@ -183,7 +200,7 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
     
     # 处理最后一批次（如果有）
     if (batch_idx + 1) % gradient_accumulation_steps != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
         optimizer.update_learning_rate()
         optimizer.zero_grad()
@@ -336,7 +353,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     
     # 其他参数
-    parser.add_argument('--cuda', action='store_true', help='是否使用CUDA')
+    parser.add_argument('--cuda', action='store_true', default=True, help='是否使用CUDA')
     parser.add_argument('--save_dir', type=str, default='checkpoints', help='模型保存目录')
     parser.add_argument('--results_file', type=str, default='results.txt', help='结果保存文件')
     
@@ -345,13 +362,18 @@ def main():
     # 设置随机种子
     set_seed(args.seed)
     
-    # 创建保存目录
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
+    # 检查CUDA可用性并设置设备
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        # 打印GPU信息
+        print(f"使用GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024 / 1024 / 1024:.2f} GB")
+    else:
+        device = torch.device('cpu')
+        print("CUDA不可用，使用CPU")
     
-    # 设置设备
-    device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+    # 创建保存目录
+    os.makedirs(args.save_dir, exist_ok=True)
     
     # 加载数据
     print("加载数据...")
@@ -359,7 +381,7 @@ def main():
         data_name=args.data,
         split_ratio=args.input_ratio,
         batch_size=args.batch_size,
-        cuda=args.cuda and torch.cuda.is_available(),
+        cuda=args.cuda,
         shuffle=True,
         loadNE=args.use_network,
         max_seq_length=args.max_seq_length
@@ -382,6 +404,9 @@ def main():
         max_seq_length=args.max_seq_length
     ).to(device)
     
+    # 打印模型是否在GPU上
+    print(f"模型是否在GPU上: {next(model.parameters()).is_cuda}")
+    
     # 如果有预训练嵌入，加载它们
     if args.use_network and hasattr(data_loader, 'embeds') and data_loader.embeds is not None:
         print("加载预训练嵌入...")
@@ -394,7 +419,7 @@ def main():
     # 定义损失函数和优化器
     crit = nn.CrossEntropyLoss(ignore_index=Constants.PAD)
     optimizer = ScheduledOptim(
-        optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-09),
+        optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-8),
         args.hidden_dim,
         args.warmup_steps
     )
