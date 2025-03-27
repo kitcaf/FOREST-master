@@ -76,9 +76,8 @@ class TimeIntervalEncoding(nn.Module):
         x = x + time_embed
         return self.dropout(x)
 
-# 简化的图注意力层，减少内存使用
 class GraphAttentionLayer(nn.Module):
-    """图注意力层"""
+    """改进的图注意力层"""
     def __init__(self, in_features, out_features, dropout=0.1, alpha=0.2):
         super(GraphAttentionLayer, self).__init__()
         self.in_features = in_features
@@ -95,16 +94,23 @@ class GraphAttentionLayer(nn.Module):
         self.leakyrelu = nn.LeakyReLU(self.alpha)
         self.dropout_layer = nn.Dropout(self.dropout)
         
-    def forward(self, input, adj):
-        # 使用更内存高效的实现
-        h = self.W(input)  # [N, out_features]
+    def forward(self, h, adj):
+        """
+        h: 节点特征 [N, in_features]
+        adj: 邻接矩阵 [N, N]
+        """
+        # 线性变换
+        Wh = self.W(h)  # [N, out_features]
         
         # 计算注意力系数
-        N = h.size(0)
+        N = Wh.size(0)
         
-        # 更高效的注意力计算
-        a_input = torch._weight_norm(h, self.a[:self.out_features], dim=1) + torch._weight_norm(h, self.a[self.out_features:], dim=1).t()
-        e = self.leakyrelu(a_input)
+        # 创建所有节点对的特征组合
+        a_input = torch.cat([Wh.repeat(1, N).view(N * N, -1), Wh.repeat(N, 1)], dim=1).view(N, N, 2 * self.out_features)
+        
+        # 计算注意力系数
+        e = torch.matmul(a_input, self.a).squeeze(2)
+        e = self.leakyrelu(e)
         
         # 掩码注意力系数
         zero_vec = -9e15 * torch.ones_like(e)
@@ -113,11 +119,10 @@ class GraphAttentionLayer(nn.Module):
         attention = self.dropout_layer(attention)
         
         # 应用注意力系数
-        h_prime = torch.matmul(attention, h)
+        h_prime = torch.matmul(attention, Wh)
         
         return h_prime
 
-# 修复的多头注意力，解决维度不匹配问题
 class MultiHeadAttention(nn.Module):
     """多头注意力机制"""
     def __init__(self, hidden_dim, n_heads, dropout=0.1):
@@ -186,7 +191,7 @@ class MultiHeadAttention(nn.Module):
         return x
 
 class EncoderLayer(nn.Module):
-    """Transformer编码器层"""
+    """编码器层"""
     def __init__(self, hidden_dim, n_heads, pf_dim, dropout=0.1):
         super(EncoderLayer, self).__init__()
         
@@ -223,123 +228,8 @@ class EncoderLayer(nn.Module):
         
         return src
 
-class Encoder(nn.Module):
-    """改进的编码器模块"""
-    def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, n_heads=8, pf_dim=512, 
-                 dropout=0.1, use_network=False, adj=None, net_dict=None, max_seq_length=1000):
-        super(Encoder, self).__init__()
-        
-        self.user_embedding = nn.Embedding(user_size, embed_dim, padding_idx=Constants.PAD)
-        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_length, dropout)
-        self.time_encoder = TimeIntervalEncoding(embed_dim, dropout)
-        
-        self.use_network = use_network
-        self.hidden_dim = hidden_dim
-        
-        if use_network:
-            self.adj = adj
-            self.net_dict = net_dict
-            self.gat1 = GraphAttentionLayer(embed_dim, embed_dim, dropout=dropout)
-            self.gat2 = GraphAttentionLayer(embed_dim, embed_dim, dropout=dropout)
-            self.nnl1 = 25  # 一阶邻居采样数
-            self.nnl2 = 10  # 二阶邻居采样数
-        
-        # 投影层，将嵌入维度映射到隐藏维度
-        self.input_projection = nn.Linear(embed_dim, hidden_dim)
-        
-        # Transformer编码器层
-        self.layers = nn.ModuleList([
-            EncoderLayer(hidden_dim, n_heads, pf_dim, dropout)
-            for _ in range(n_layers)
-        ])
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def neighbor_sampling(self, nodes, sample_size):
-        """采样邻居节点"""
-        result = []
-        for node in nodes:
-            # 获取邻居
-            if node in self.net_dict and len(self.net_dict[node]) > 0:
-                neighbors = list(self.net_dict[node])
-                # 如果邻居数量不足，则重复采样
-                if len(neighbors) < sample_size:
-                    neighbors = neighbors * (sample_size // len(neighbors) + 1)
-                # 随机采样
-                sampled = np.random.choice(neighbors, sample_size, replace=False)
-                result.append(sampled)
-            else:
-                # 如果没有邻居，则采样随机节点
-                result.append(np.random.randint(0, len(self.net_dict), sample_size))
-        return np.array(result)
-        
-    def forward(self, src, src_lengths, time_intervals=None):
-        # src: [batch_size, src_len]
-        # time_intervals: [batch_size, src_len] - 可选的时间间隔信息
-        
-        batch_size, src_len = src.shape
-        
-        # 创建掩码
-        src_mask = (src != Constants.PAD).float()  # [batch_size, src_len]
-        
-        # 基本嵌入
-        embedded = self.user_embedding(src)  # [batch_size, src_len, embed_dim]
-        embedded = self.pos_encoder(embedded)
-        
-        # 如果有时间间隔信息，则添加时间编码
-        if time_intervals is not None:
-            embedded = self.time_encoder(embedded, time_intervals)
-        
-        # 社交网络增强
-        if self.use_network:
-            # 采样一阶和二阶邻居
-            nb1 = self.neighbor_sampling(src.view(-1).cpu().numpy(), self.nnl1)  # [batch*src_len, nnl1]
-            nb2 = self.neighbor_sampling(nb1.reshape(-1), self.nnl2)  # [batch*src_len*nnl1, nnl2]
-            
-            # 获取邻居嵌入
-            nb2_embed = self.user_embedding(torch.LongTensor(nb2).to(src.device))  # [batch*src_len*nnl1, nnl2, embed_dim]
-            
-            # 图注意力聚合
-            # 为简化计算，我们对每个节点的邻居单独应用GAT
-            nb2_flat = nb2_embed.view(-1, nb2_embed.size(-1))  # [batch*src_len*nnl1*nnl2, embed_dim]
-            
-            # 创建临时邻接矩阵（全连接）
-            temp_adj = torch.ones(nb2_embed.size(1), nb2_embed.size(1)).to(src.device)
-            
-            # 应用GAT
-            nf2_list = []
-            for i in range(nb2_embed.size(0)):
-                nf2_list.append(self.gat2(nb2_embed[i], temp_adj))
-            
-            nf2 = torch.stack(nf2_list).mean(dim=1)  # [batch*src_len*nnl1, embed_dim]
-            nf2 = nf2.view(-1, self.nnl1, embedded.size(2))  # [batch*src_len, nnl1, embed_dim]
-            
-            # 再次应用GAT
-            nf1_list = []
-            for i in range(nf2.size(0)):
-                nf1_list.append(self.gat1(nf2[i], temp_adj[:self.nnl1, :self.nnl1]))
-            
-            nf1 = torch.stack(nf1_list)  # [batch*src_len, embed_dim]
-            nf1 = nf1.view(batch_size, src_len, -1)  # [batch_size, src_len, embed_dim]
-            
-            # 结合原始嵌入和图增强嵌入
-            embedded = embedded + nf1
-        
-        # 投影到隐藏维度
-        src = self.input_projection(embedded)  # [batch_size, src_len, hidden_dim]
-        
-        # 应用Transformer编码器层
-        for layer in self.layers:
-            src = layer(src, src_mask)
-        
-        # 获取序列的表示
-        # 使用平均池化获取整个序列的表示
-        src_pooled = (src * src_mask.unsqueeze(-1)).sum(dim=1) / src_mask.sum(dim=1, keepdim=True)
-        
-        return src, src_pooled  # [batch_size, src_len, hidden_dim], [batch_size, hidden_dim]
-
 class DecoderLayer(nn.Module):
-    """Transformer解码器层"""
+    """解码器层"""
     def __init__(self, hidden_dim, n_heads, pf_dim, dropout=0.1):
         super(DecoderLayer, self).__init__()
         
@@ -386,18 +276,112 @@ class DecoderLayer(nn.Module):
         
         return tgt
 
+class Encoder(nn.Module):
+    """改进的编码器模块"""
+    def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, n_heads=8, pf_dim=512, dropout=0.1, 
+                 use_network=False, adj=None, net_dict=None, max_seq_length=1000):
+        super(Encoder, self).__init__()
+        
+        self.user_size = user_size
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.use_network = use_network
+        self.adj = adj
+        
+        # 用户嵌入
+        self.user_embedding = nn.Embedding(user_size, embed_dim, padding_idx=Constants.PAD)
+        
+        # 位置编码
+        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_length, dropout)
+        
+        # 时间间隔编码
+        self.time_encoder = TimeIntervalEncoding(embed_dim, dropout)
+        
+        # 图注意力网络
+        if use_network and adj is not None:
+            self.gat = GraphAttentionLayer(embed_dim, embed_dim, dropout=dropout)
+            # 添加第二层GAT以捕获更复杂的图结构
+            self.gat2 = GraphAttentionLayer(embed_dim, embed_dim, dropout=dropout)
+        
+        # 投影层，将嵌入维度映射到隐藏维度
+        self.input_projection = nn.Linear(embed_dim, hidden_dim)
+        
+        # 编码器层
+        self.layers = nn.ModuleList([
+            EncoderLayer(hidden_dim, n_heads, pf_dim, dropout)
+            for _ in range(n_layers)
+        ])
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, src, src_lengths, time_intervals=None):
+        # src: [batch_size, src_len]
+        # src_lengths: [batch_size]
+        # time_intervals: [batch_size, src_len] - 可选的时间间隔信息
+        
+        batch_size, src_len = src.shape
+        
+        # 创建掩码
+        src_mask = (src != Constants.PAD).float()  # [batch_size, src_len]
+        
+        # 基本嵌入
+        embedded = self.user_embedding(src)  # [batch_size, src_len, embed_dim]
+        
+        # 应用位置编码
+        embedded = self.pos_encoder(embedded)
+        
+        # 应用时间间隔编码（如果提供）
+        if time_intervals is not None:
+            embedded = self.time_encoder(embedded, time_intervals)
+        
+        # 应用图注意力网络（如果使用社交网络）
+        if self.use_network and self.adj is not None:
+            # 保存原始嵌入
+            original_shape = embedded.shape
+            
+            # 重塑为[batch_size * src_len, embed_dim]以应用GAT
+            flat_embedded = embedded.view(-1, self.embed_dim)
+            
+            # 应用第一层GAT
+            gat_output = self.gat(flat_embedded, self.adj)
+            
+            # 应用第二层GAT以捕获更复杂的图结构
+            gat_output = self.gat2(gat_output, self.adj)
+            
+            # 重塑回原始形状
+            gat_output = gat_output.view(original_shape)
+            
+            # 残差连接
+            embedded = embedded + gat_output
+        
+        # 投影到隐藏维度
+        src = self.input_projection(embedded)  # [batch_size, src_len, hidden_dim]
+        
+        # 应用编码器层
+        for layer in self.layers:
+            src = layer(src, src_mask)
+        
+        return src, embedded
+
 class Decoder(nn.Module):
-    """改进的解码器模块"""
+    """解码器模块"""
     def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, n_heads=8, pf_dim=512, dropout=0.1, max_seq_length=1000):
         super(Decoder, self).__init__()
         
+        self.user_size = user_size
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        
+        # 用户嵌入
         self.user_embedding = nn.Embedding(user_size, embed_dim, padding_idx=Constants.PAD)
+        
+        # 位置编码
         self.pos_encoder = PositionalEncoding(embed_dim, max_seq_length, dropout)
         
         # 投影层，将嵌入维度映射到隐藏维度
         self.input_projection = nn.Linear(embed_dim, hidden_dim)
         
-        # Transformer解码器层
+        # 解码器层
         self.layers = nn.ModuleList([
             DecoderLayer(hidden_dim, n_heads, pf_dim, dropout)
             for _ in range(n_layers)
@@ -418,18 +402,27 @@ class Decoder(nn.Module):
         # 创建掩码
         tgt_mask = (tgt != Constants.PAD).float()  # [batch_size, tgt_len]
         
+        # 创建后续掩码（防止看到未来的token）
+        subsequent_mask = torch.triu(
+            torch.ones((tgt_len, tgt_len), device=tgt.device) * float('-inf'),
+            diagonal=1
+        )
+        subsequent_mask = subsequent_mask.unsqueeze(0).expand(batch_size, -1, -1)  # [batch_size, tgt_len, tgt_len]
+        
         # 基本嵌入
         embedded = self.user_embedding(tgt)  # [batch_size, tgt_len, embed_dim]
+        
+        # 应用位置编码
         embedded = self.pos_encoder(embedded)
         
         # 投影到隐藏维度
         tgt = self.input_projection(embedded)  # [batch_size, tgt_len, hidden_dim]
         
-        # 应用Transformer解码器层
+        # 应用解码器层
         for layer in self.layers:
             tgt = layer(tgt, enc_src, tgt_mask, src_mask)
         
-        # 预测下一个用户
+        # 输出层
         output = self.fc_out(tgt)  # [batch_size, tgt_len, user_size]
         
         return output
@@ -439,6 +432,10 @@ class ImprovedSeq2SeqModel(nn.Module):
     def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, n_heads=8, pf_dim=512, dropout=0.1, 
                  use_network=False, adj=None, net_dict=None, teacher_forcing_ratio=0.5, max_seq_length=1000):
         super(ImprovedSeq2SeqModel, self).__init__()
+        
+        # 确保adj是稀疏张量
+        if adj is not None and not isinstance(adj, torch.sparse.FloatTensor):
+            print("警告：邻接矩阵不是稀疏张量，性能可能受影响")
         
         self.encoder = Encoder(
             user_size, embed_dim, hidden_dim, n_layers, n_heads, pf_dim, dropout, 
@@ -452,16 +449,14 @@ class ImprovedSeq2SeqModel(nn.Module):
         self.user_size = user_size
         self.teacher_forcing_ratio = teacher_forcing_ratio
         self.hidden_dim = hidden_dim
-        
+        self.use_network = use_network
+    
     def create_mask(self, src):
-        # 创建源序列的掩码
-        return (src != Constants.PAD).float()  # [batch_size, src_len]
-        
+        """创建源序列掩码"""
+        return (src != Constants.PAD).float()
+    
     def forward(self, src, src_lengths, tgt, time_intervals=None, teacher_forcing_ratio=None):
-        # src: [batch_size, src_len]
-        # tgt: [batch_size, tgt_len]
-        # time_intervals: [batch_size, src_len] - 可选的时间间隔信息
-        
+        """前向传播"""
         if teacher_forcing_ratio is None:
             teacher_forcing_ratio = self.teacher_forcing_ratio
             
@@ -501,8 +496,8 @@ class ImprovedSeq2SeqModel(nn.Module):
             
         return outputs
     
-    def generate(self, src, src_lengths, max_len=100, time_intervals=None, start_tokens=None):
-        """生成序列"""
+    def generate(self, src, src_lengths, max_len=3, time_intervals=None, start_tokens=None):
+        """生成序列，固定生成3个节点"""
         batch_size = src.size(0)
         
         # 创建掩码
@@ -524,7 +519,7 @@ class ImprovedSeq2SeqModel(nn.Module):
         # 已生成的用户集合（避免重复）
         generated_users = [set() for _ in range(batch_size)]
         
-        # 逐步生成
+        # 逐步生成，固定生成3个节点
         for t in range(max_len):
             # 解码一步
             output = self.decoder(decoder_input, enc_src, src_mask)  # [batch_size, t+1, user_size]
@@ -546,10 +541,7 @@ class ImprovedSeq2SeqModel(nn.Module):
             generated_probs[:, t, :] = F.softmax(step_output, dim=1)
             
             # 采样下一个用户
-            if t < 5:  # 前几步使用贪婪搜索
-                top1 = step_output.argmax(1)
-            else:  # 后面使用采样
-                top1 = torch.multinomial(F.softmax(step_output, dim=1), 1).squeeze()
+            top1 = step_output.argmax(1)  # 使用贪婪搜索确保最佳预测
             
             # 存储生成的用户
             generated_seq[:, t] = top1
@@ -557,8 +549,4 @@ class ImprovedSeq2SeqModel(nn.Module):
             # 更新解码器输入
             decoder_input = torch.cat([decoder_input, top1.unsqueeze(1)], dim=1)  # [batch_size, t+2]
             
-            # 如果生成了EOS，则停止
-            if (top1 == Constants.EOS).all():
-                break
-                
         return generated_seq, generated_probs 

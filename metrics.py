@@ -7,6 +7,7 @@ import collections
 from sklearn.preprocessing import label_binarize
 from scipy.stats import rankdata
 import Constants
+import torch
 
 def _retype(y_prob, y):
     if not isinstance(y, (collections.Sequence, np.ndarray)):
@@ -55,29 +56,64 @@ def apk(actual, predicted, k=10):
     return score / min(len(actual), k)
 
 
+def hits_k(y_prob, y, k=10):
+    """
+    计算Hits@k指标
+    
+    参数:
+        y_prob: 预测概率或分数，形状为[n_classes]
+        y: 真实标签，单个标量
+        k: 考虑的前k个预测
+        
+    返回:
+        Hits@k分数 (1.0 或 0.0)
+    """
+    # 确保输入格式正确
+    if isinstance(y_prob, torch.Tensor):
+        y_prob = y_prob.detach().cpu().numpy()
+    if isinstance(y, torch.Tensor):
+        y = y.detach().cpu().item()  # 转换为标量
+    
+    # 确保k不超过预测张量的维度
+    effective_k = min(k, y_prob.shape[0])
+    if effective_k <= 0:
+        return 0.0
+    
+    # 获取前k个预测的索引
+    top_indices = np.argsort(y_prob)[-effective_k:]
+    
+    # 检查真实标签是否在前k个预测中
+    return 1.0 if y in top_indices else 0.0
+
 def mapk(y_prob, y, k=10):
     """
-    Computes the mean average precision at k.
-    This function computes the mean average prescision at k between two lists
-    of lists of items.
-    Parameters
-    ----------
-    actual : list
-             A list of lists of elements that are to be predicted
-             (order doesn't matter in the lists)
-    predicted : list
-                A list of lists of predicted elements
-                (order matters in the lists)
-    k : int, optional
-        The maximum number of predicted elements
-    Returns
-    -------
-    score : double
-            The mean average precision at k over the input lists
+    计算单个样本的Average Precision@k
+    
+    参数:
+        y_prob: 预测概率或分数，形状为[n_classes]
+        y: 真实标签，单个标量
+        k: 考虑的前k个预测
+        
+    返回:
+        AP@k分数
     """
-    predicted = [np.argsort(p_)[-k:][::-1] for p_ in y_prob]
-    actual = [[y_] for y_ in y]
-    return np.mean([apk(a, p, k) for a, p in zip(actual, predicted)])
+    # 确保输入格式正确
+    if isinstance(y_prob, torch.Tensor):
+        y_prob = y_prob.detach().cpu().numpy()
+    if isinstance(y, torch.Tensor):
+        y = y.detach().cpu().item()  # 转换为标量
+    
+    # 确保k不超过预测张量的维度
+    effective_k = min(k, y_prob.shape[0])
+    if effective_k <= 0:
+        return 0.0
+    
+    # 获取前k个预测的索引
+    top_indices = np.argsort(y_prob)[-effective_k:][::-1]
+    
+    # 计算AP@k
+    actual = [y]  # 单个元素的列表
+    return apk(actual, top_indices, k)
 
 
 def mean_rank(y_prob, y):
@@ -88,13 +124,6 @@ def mean_rank(y_prob, y):
 
     return sum(ranks) / float(len(ranks))
 
-
-def hits_k(y_prob, y, k=10):
-    acc = []
-    for p_, y_ in zip(y_prob, y):
-        top_k = p_.argsort()[-k:][::-1]
-        acc += [1. if y_ in top_k else 0.]
-    return sum(acc) / len(acc)
 
 def portfolio(pred, gold, k_list=[1,5,10,20]):
     scores_len = 0
