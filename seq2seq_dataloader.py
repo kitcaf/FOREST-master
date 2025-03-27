@@ -150,97 +150,93 @@ class Seq2SeqDataLoader:
         print(f"测试集大小: {len(self.test_cascades)}")
     
     def _read_cascades(self, file_path, max_len=None):
-        """读取级联数据，包括时间戳，限制最大长度"""
-        if max_len is None:
-            max_len = self.max_seq_length
-            
+        """读取级联数据"""
         cascades = []
         timestamps = []
         
         for line in open(file_path):
             if len(line.strip()) == 0:
                 continue
-            
-            userlist = []
-            timelist = []
+                
             chunks = line.strip().split()
+            cascade = []
+            timestamp = []
             
             for chunk in chunks:
-                parts = chunk.split(',')
-                if len(parts) >= 2:
-                    user, timestamp = parts[0], float(parts[1])
-                    if user in self._u2idx:
-                        userlist.append(self._u2idx[user])
-                        timelist.append(timestamp)
+                user, time = chunk.split(',')
+                
+                # 将用户名转换为ID
+                if user in self._u2idx:
+                    user_id = self._u2idx[user]
+                else:
+                    user_id = self._u2idx['<unk>']
+                
+                # 将时间转换为浮点数
+                time = float(time)
+                
+                cascade.append(user_id)
+                timestamp.append(time)
             
-            # 只保留长度大于2且小于max_len的级联
-            if 2 < len(userlist) <= max_len:
-                cascades.append(userlist)
-                timestamps.append(timelist)
+            # 如果指定了最大长度，截断过长的级联
+            if max_len is not None and len(cascade) > max_len:
+                cascade = cascade[:max_len]
+                timestamp = timestamp[:max_len]
+            
+            cascades.append(cascade)
+            timestamps.append(timestamp)
         
         return cascades, timestamps
     
-    def _calculate_time_intervals(self, timestamps_list):
+    def _calculate_time_intervals(self, timestamps):
         """计算时间间隔"""
-        intervals_list = []
+        intervals = []
         
-        for timestamps in timestamps_list:
-            if len(timestamps) <= 1:
-                intervals = [0.0]
-            else:
-                # 计算相邻时间戳之间的间隔
-                intervals = [0.0]  # 第一个时间戳的间隔为0
-                for i in range(1, len(timestamps)):
-                    interval = timestamps[i] - timestamps[i-1]
-                    # 归一化时间间隔，避免数值过大
-                    interval = min(interval, 86400) / 86400  # 限制最大为1天，并归一化
-                    intervals.append(interval)
+        for ts in timestamps:
+            interval = [0.0]  # 第一个用户的时间间隔为0
             
-            intervals_list.append(intervals)
+            for i in range(1, len(ts)):
+                interval.append(ts[i] - ts[i-1])
+            
+            intervals.append(interval)
         
-        return intervals_list
+        return intervals
     
     def _load_network_data(self):
         """加载社交网络数据"""
-        # 读取边数据
-        self.adj_list = [[], [], []]
+        print("加载社交网络数据...")
+        
+        # 创建邻接矩阵
+        adj = sp.lil_matrix((self.user_size, self.user_size))
         self.adj_dict = {}
         
-        # 添加自环
-        for i in range(self.user_size):
-            self.adj_list[0].append(i)
-            self.adj_list[1].append(i)
-            self.adj_list[2].append(1)
-            self.adj_dict[i] = [i]
-        
-        # 读取边
-        for line in open(self.net_data_path):
-            if len(line.strip()) == 0:
-                continue
-            
-            nodes = line.strip().split(',')
-            if nodes[0] not in self._u2idx or nodes[1] not in self._u2idx:
-                continue
-            
-            u1 = self._u2idx[nodes[0]]
-            u2 = self._u2idx[nodes[1]]
-            
-            self.adj_list[0].append(u1)
-            self.adj_list[1].append(u2)
-            self.adj_list[2].append(1)
-            
-            if u1 not in self.adj_dict:
-                self.adj_dict[u1] = []
-            if u2 not in self.adj_dict:
-                self.adj_dict[u2] = []
-            
-            self.adj_dict[u1].append(u2)
-            self.adj_dict[u2].append(u1)
-        
-        # 创建稀疏邻接矩阵
-        adj = sp.coo_matrix((self.adj_list[2], (self.adj_list[0], self.adj_list[1])),
-                           shape=(self.user_size, self.user_size),
-                           dtype=np.float32)
+        # 读取边数据
+        edge_count = 0
+        with open(self.net_data_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) != 2:
+                    continue
+                    
+                user1, user2 = parts
+                
+                # 检查用户是否在词典中
+                if user1 in self._u2idx and user2 in self._u2idx:
+                    idx1 = self._u2idx[user1]
+                    idx2 = self._u2idx[user2]
+                    
+                    # 添加边（无向图）
+                    adj[idx1, idx2] = 1
+                    adj[idx2, idx1] = 1
+                    edge_count += 1
+                    
+                    # 记录邻居关系
+                    if idx1 not in self.adj_dict:
+                        self.adj_dict[idx1] = []
+                    if idx2 not in self.adj_dict:
+                        self.adj_dict[idx2] = []
+                        
+                    self.adj_dict[idx1].append(idx2)
+                    self.adj_dict[idx2].append(idx1)
         
         # 归一化邻接矩阵
         adj = normalize(adj)
@@ -250,15 +246,17 @@ class Seq2SeqDataLoader:
         if self.cuda:
             self.adj_tensor = self.adj_tensor.cuda()
         
-        # 加载预训练嵌入（如果有）
+        print(f"社交网络加载完成，共有 {len(self.adj_dict)} 个有连接的用户，{edge_count} 条边")
+        
+        # 加载预训练嵌入
         try:
-            self.embeds = self._load_embeddings()
-            print("已加载预训练嵌入")
-        except:
-            print("无法加载预训练嵌入")
+            self.embeds = self._load_pretrained_embeds()
+            print(f"预训练嵌入加载完成，形状: {self.embeds.shape}")
+        except Exception as e:
+            print(f"加载预训练嵌入失败: {e}")
             self.embeds = None
     
-    def _load_embeddings(self):
+    def _load_pretrained_embeds(self):
         """加载预训练嵌入"""
         embeds = np.zeros((self.user_size, self.embed_dim))
         
@@ -294,6 +292,12 @@ class Seq2SeqDataLoader:
         # 将级联和时间间隔配对
         paired_data = list(zip(cascades, intervals))
         
+        # 过滤掉长度小于等于3的级联
+        paired_data = [pair for pair in paired_data if len(pair[0]) > 3]
+        
+        if not paired_data:
+            return []
+        
         # 根据级联长度排序
         sorted_data = sorted(paired_data, key=lambda x: len(x[0]))
         
@@ -303,16 +307,20 @@ class Seq2SeqDataLoader:
         
         for cascade, interval in sorted_data:
             if len(current_batch) == self.batch_size:
-                batches.append(self._prepare_seq2seq_batch([item[0] for item in current_batch], 
-                                                          [item[1] for item in current_batch]))
+                batch = self._prepare_seq2seq_batch([item[0] for item in current_batch], 
+                                                  [item[1] for item in current_batch])
+                if batch is not None:
+                    batches.append(batch)
                 current_batch = []
             
             current_batch.append((cascade, interval))
         
         # 添加最后一个批次
         if current_batch:
-            batches.append(self._prepare_seq2seq_batch([item[0] for item in current_batch], 
-                                                      [item[1] for item in current_batch]))
+            batch = self._prepare_seq2seq_batch([item[0] for item in current_batch], 
+                                              [item[1] for item in current_batch])
+            if batch is not None:
+                batches.append(batch)
         
         # 打乱批次顺序
         if self.shuffle:
@@ -321,13 +329,10 @@ class Seq2SeqDataLoader:
         return batches
     
     def _prepare_seq2seq_batch(self, cascades, intervals, split_ratio=None):
-        """准备序列到序列批次，使用半精度浮点数减少内存使用"""
+        """准备序列到序列批次，输入是原序列长度-3，输出是后面3个节点"""
         # 使用传入的分割比例或默认值
         if split_ratio is None:
             split_ratio = self.split_ratio
-        
-        # 找到最长的级联
-        max_len = min(max(len(c) for c in cascades), self.max_seq_length)
         
         # 创建源序列和目标序列
         src_seqs = []
@@ -336,17 +341,16 @@ class Seq2SeqDataLoader:
         src_intervals = []
         
         for cascade, interval in zip(cascades, intervals):
-            # 截断过长的序列
-            if len(cascade) > self.max_seq_length:
-                cascade = cascade[:self.max_seq_length]
-                interval = interval[:self.max_seq_length]
-                
-            # 计算分割点
-            split_point = max(2, int(len(cascade) * split_ratio))
+            # 只处理长度大于3的级联
+            if len(cascade) <= 3:
+                continue
+            
+            # 计算分割点：取除最后3个节点外的所有节点作为输入
+            split_point = len(cascade) - 3
             
             # 创建源序列和目标序列
             src = cascade[:split_point]
-            tgt = [Constants.BOS] + cascade[split_point:] + [Constants.EOS]
+            tgt = [Constants.BOS] + cascade[split_point:] + [Constants.EOS]  # 最后3个节点加上BOS和EOS
             
             # 获取源序列的时间间隔
             src_interval = interval[:split_point]
@@ -354,14 +358,23 @@ class Seq2SeqDataLoader:
             # 记录源序列长度
             src_lengths.append(len(src))
             
-            # 填充序列
-            src = src + [Constants.PAD] * (max_len - len(src))
-            tgt = tgt + [Constants.PAD] * (max_len - len(tgt))
-            src_interval = src_interval + [0.0] * (max_len - len(src_interval))
-            
             src_seqs.append(src)
             tgt_seqs.append(tgt)
             src_intervals.append(src_interval)
+        
+        # 如果没有有效的级联，返回空批次
+        if not src_seqs:
+            return None
+        
+        # 找到最长的级联
+        max_src_len = max(len(s) for s in src_seqs)
+        max_tgt_len = 5  # BOS + 3个节点 + EOS
+        
+        # 填充序列
+        for i in range(len(src_seqs)):
+            src_seqs[i] = src_seqs[i] + [Constants.PAD] * (max_src_len - len(src_seqs[i]))
+            tgt_seqs[i] = tgt_seqs[i] + [Constants.PAD] * (max_tgt_len - len(tgt_seqs[i]))
+            src_intervals[i] = src_intervals[i] + [0.0] * (max_src_len - len(src_intervals[i]))
         
         # 转换为张量
         src_tensor = torch.LongTensor(src_seqs)
