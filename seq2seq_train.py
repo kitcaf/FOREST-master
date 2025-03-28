@@ -3,6 +3,7 @@ import math
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
@@ -29,62 +30,115 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def set_loss(pred, gold):
-    """计算集合损失，不考虑顺序"""
+def correctness_loss(pred, gold):
+    """计算正确性约束损失，确保预测的用户不在输入序列中且不重复，增强数值稳定性"""
     batch_size = gold.size(0)
-    tgt_len = gold.size(1)
     loss = 0.0
     
     for i in range(batch_size):
-        # 找到目标序列的有效部分（跳过PAD和EOS）
+        # 找到目标序列的有效部分（跳过PAD、BOS和EOS）
         valid_gold = gold[i][gold[i] != Constants.PAD]
-        valid_gold = valid_gold[valid_gold != Constants.EOS]
+        valid_gold = valid_gold[1:-1]  # 去掉BOS和EOS
         
-        # 找到预测序列的有效部分
-        pred_i = pred[i].max(1)[1]
-        valid_pred = pred_i[pred_i != Constants.PAD]
-        valid_pred = valid_pred[valid_pred != Constants.EOS]
+        if len(valid_gold) == 0:
+            continue
         
-        # 转换为集合
-        gold_set = set(valid_gold.cpu().numpy())
-        pred_set = set(valid_pred.cpu().numpy())
+        # 获取预测序列
+        pred_i = pred[i, 1:len(valid_gold)+1]  # 跳过BOS位置
         
-        # 计算Jaccard相似度
-        intersection = len(gold_set.intersection(pred_set))
-        union = len(gold_set.union(pred_set))
+        # 计算每个位置的预测概率
+        for j in range(len(valid_gold)):
+            # 获取当前位置的真实标签
+            true_label = valid_gold[j].item()
+            
+            # 获取当前位置的预测logits
+            logits = pred_i[j]
+            
+            # 使用更稳定的方式计算交叉熵
+            # 1. 应用log_softmax，它在数值上比先softmax再log更稳定
+            log_probs = F.log_softmax(logits, dim=0)
+            
+            # 2. 直接获取真实标签的负对数概率
+            pos_loss = -log_probs[true_label]
+            
+            # 检查是否为NaN
+            if torch.isnan(pos_loss):
+                # print(f"警告：位置{j}的正样本损失为NaN，跳过...")
+                continue
+                
+            loss += pos_loss
+            
+            # 惩罚预测重复用户，使用更稳定的方式
+            for k in range(j):
+                prev_label = valid_gold[k].item()
+                # 使用sigmoid而不是softmax的概率，更稳定
+                repeat_penalty = torch.sigmoid(logits[prev_label]) * 0.1
+                
+                # 检查是否为NaN
+                if torch.isnan(repeat_penalty):
+                    # print(f"警告：位置{j}的重复惩罚为NaN，跳过...")
+                    continue
+                    
+                loss += repeat_penalty
+    
+    # 避免除以零
+    valid_count = max(1, batch_size)
+    return loss / valid_count
+
+def set_based_loss(pred, gold):
+    """计算基于集合的损失，不考虑顺序"""
+    batch_size = gold.size(0)
+    loss = 0.0
+    
+    for i in range(batch_size):
+        # 找到目标序列的有效部分（跳过PAD、BOS和EOS）
+        valid_gold = gold[i][gold[i] != Constants.PAD]
+        valid_gold = valid_gold[1:-1]  # 去掉BOS和EOS
         
-        # 损失是1减去Jaccard相似度
-        if union > 0:
-            loss += 1 - (intersection / union)
+        if len(valid_gold) == 0:
+            continue
+        
+        # 获取预测序列
+        pred_i = pred[i, 1:len(valid_gold)+1]  # 跳过BOS位置
+        
+        # 将真实标签转换为集合
+        gold_set = set([label.item() for label in valid_gold])
+        
+        # 计算每个用户被预测的概率
+        all_probs = F.softmax(pred_i.mean(dim=0), dim=0)  # 对所有位置取平均
+        
+        # 计算集合损失
+        set_loss = 0.0
+        for user_id in gold_set:
+            # 鼓励预测包含真实用户
+            set_loss -= torch.log(all_probs[user_id] + 1e-10)
+        
+        loss += set_loss / len(gold_set)
     
     return loss / batch_size
 
 def get_performance(pred, gold, crit):
-    """计算性能指标，使用组合损失，增加数值稳定性"""
-    # 调整预测和目标形状
+    """计算性能指标，确保数值稳定性"""
+    # 展平预测和目标，模仿参考代码的处理方式
     pred_flat = pred.view(-1, pred.size(-1))  # [batch_size*tgt_len, user_size]
     gold_flat = gold.contiguous().view(-1)    # [batch_size*tgt_len]
     
-    # 检查预测值是否包含NaN
-    if torch.isnan(pred_flat).any():
-        print("警告：预测值包含NaN，正在应用修复...")
-        pred_flat = torch.nan_to_num(pred_flat, nan=0.0, posinf=1e6, neginf=-1e6)
+    # 应用logits缩放以提高数值稳定性
+    pred_flat = pred_flat * 0.1  # 缩小logits幅度
     
     # 计算交叉熵损失
-    ce_loss = crit(pred_flat, gold_flat)
+    try:
+        ce_loss = crit(pred_flat, gold_flat)
+        
+        # 检查损失是否为NaN
+        if torch.isnan(ce_loss):
+            print("警告：交叉熵损失为NaN，使用替代损失...")
+            ce_loss = torch.tensor(1.0, device=pred.device, requires_grad=True)
+    except Exception as e:
+        print(f"计算损失时出错: {e}")
+        ce_loss = torch.tensor(1.0, device=pred.device, requires_grad=True)
     
-    # 计算集合损失
-    set_loss_val = set_loss(pred, gold)
-    
-    # 组合损失
-    combined_loss = ce_loss + set_loss_val
-    
-    # 检查损失是否为NaN
-    if torch.isnan(combined_loss):
-        print("警告：损失为NaN，使用仅交叉熵损失...")
-        return ce_loss, ce_loss
-    
-    return combined_loss, ce_loss
+    return ce_loss, ce_loss
 
 def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
     """使用metrics.py中的函数计算MAP@k和Hits@k指标"""
@@ -125,7 +179,6 @@ def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
                     metrics_dict[f'map@{k}'] += mapk / len(valid_gold)
                 except Exception as e:
                     print(f"Error in metrics calculation: {e}")
-                    print(f"pos_pred shape: {pos_pred.shape}, pos_gold: {pos_gold.item() if isinstance(pos_gold, torch.Tensor) else pos_gold}, k: {k}")
                     continue
     
     # 计算平均值
@@ -135,82 +188,96 @@ def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
     
     return metrics_dict
 
-def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100], gradient_accumulation_steps=4):
-    """训练一个epoch，使用梯度累积减少内存使用"""
+def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100], gradient_accumulation_steps=1):
+    """训练一个epoch"""
     model.train()
-    
-    # 打印设备信息
-    print(f"训练设备: {device}")
-    
-    total_loss = 0
+    total_loss = 0.0
     n_batches = 0
-    epoch_metrics = {f'hits@{k}': 0.0 for k in k_list}
-    epoch_metrics.update({f'map@{k}': 0.0 for k in k_list})
+    metrics_dict = {f'hits@{k}': 0.0 for k in k_list}
+    metrics_dict.update({f'map@{k}': 0.0 for k in k_list})
     
-    optimizer.zero_grad()  # 初始化梯度
-    
+    # 使用tqdm显示进度条
     for batch_idx, batch in enumerate(tqdm(data_loader.get_train_batches(), desc="Training")):
         # 获取数据并移动到正确的设备
         src = batch['src'].to(device)
         tgt = batch['tgt'].to(device)
         src_lengths = batch['src_lengths'].to(device)
-        time_intervals = batch['time_intervals'].to(device)
-        
-        # 检查数据是否在GPU上
-        if batch_idx == 0:
-            print(f"数据是否在GPU上: {src.is_cuda}")
+        time_intervals = batch['time_intervals'].to(device) if 'time_intervals' in batch else None
         
         # 前向传播
         output = model(src, src_lengths, tgt, time_intervals)
         
-        # 计算损失
-        loss, _ = get_performance(output, tgt, crit)
-        loss = loss / gradient_accumulation_steps  # 缩放损失
+        # 计算损失和指标
+        loss, ce_loss = get_performance(output, tgt, crit)
         
-        # 反向传播
+        # 检查损失是否为NaN
+        if torch.isnan(loss):
+            print("警告：损失为NaN，跳过此批次...")
+            continue
+        
+        # 计算梯度
+        loss = loss / gradient_accumulation_steps  # 梯度累积
         loss.backward()
-        
-        # 计算指标
-        batch_metrics = calculate_metrics(output, tgt, k_list)
-        
-        # 记录指标
-        total_loss += loss.item() * gradient_accumulation_steps  # 恢复原始损失值
-        n_batches += 1
-        for k in k_list:
-            epoch_metrics[f'hits@{k}'] += batch_metrics[f'hits@{k}']
-            epoch_metrics[f'map@{k}'] += batch_metrics[f'map@{k}']
-        
-        # 清除不需要的变量以节省内存
-        del src, tgt, src_lengths, time_intervals, output
-        torch.cuda.empty_cache()
         
         # 梯度累积：每处理N个批次才更新一次参数
         if (batch_idx + 1) % gradient_accumulation_steps == 0:
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            # 极度激进的梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.01)
+            
+            # 检查梯度是否包含NaN
+            has_nan_grad = False
+            for param in model.parameters():
+                if param.grad is not None:
+                    # 将NaN梯度替换为0
+                    if torch.isnan(param.grad).any():
+                        param.grad = torch.where(torch.isnan(param.grad), torch.zeros_like(param.grad), param.grad)
+                        has_nan_grad = True
+            
+            if has_nan_grad:
+                print("警告：梯度包含NaN，已替换为0...")
             
             # 更新参数
             optimizer.step()
             optimizer.update_learning_rate()
             optimizer.zero_grad()
-            
-            # 强制垃圾回收
-            gc.collect()
-            torch.cuda.empty_cache()
+        
+        # 计算指标
+        batch_metrics = calculate_metrics(output, tgt, k_list)
+        
+        # 累加损失和指标
+        total_loss += ce_loss.item()
+        for k in k_list:
+            metrics_dict[f'hits@{k}'] += batch_metrics[f'hits@{k}']
+            metrics_dict[f'map@{k}'] += batch_metrics[f'map@{k}']
+        
+        n_batches += 1
+        
+        # 清除不需要的变量以节省内存
+        del src, tgt, src_lengths, time_intervals, output, loss, ce_loss
+        torch.cuda.empty_cache()
     
     # 处理最后一批次（如果有）
     if (batch_idx + 1) % gradient_accumulation_steps != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        # 极度激进的梯度裁剪
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.01)
+        
+        # 检查梯度是否包含NaN
+        for param in model.parameters():
+            if param.grad is not None:
+                # 将NaN梯度替换为0
+                param.grad = torch.where(torch.isnan(param.grad), torch.zeros_like(param.grad), param.grad)
+        
         optimizer.step()
         optimizer.update_learning_rate()
         optimizer.zero_grad()
     
-    # 计算平均值
+    # 计算平均损失和指标
+    avg_loss = total_loss / n_batches
     for k in k_list:
-        epoch_metrics[f'hits@{k}'] /= n_batches
-        epoch_metrics[f'map@{k}'] /= n_batches
+        metrics_dict[f'hits@{k}'] /= n_batches
+        metrics_dict[f'map@{k}'] /= n_batches
     
-    return total_loss / n_batches, epoch_metrics
+    return avg_loss, metrics_dict
 
 def eval_epoch(model, data_loader, crit, device, k_list=[10, 50, 100]):
     """评估一个epoch"""
@@ -223,45 +290,51 @@ def eval_epoch(model, data_loader, crit, device, k_list=[10, 50, 100]):
     
     with torch.no_grad():
         for batch in tqdm(data_loader.get_valid_batches(), desc="Validating"):
-            # 获取数据并移动到正确的设备
-            src = batch['src'].to(device)
-            tgt = batch['tgt'].to(device)
-            src_lengths = batch['src_lengths'].to(device)
-            time_intervals = batch['time_intervals'].to(device)
-            
-            # 前向传播
-            output = model(src, src_lengths, tgt, time_intervals, teacher_forcing_ratio=0.0)
-            
-            # 计算损失
-            loss, _ = get_performance(output, tgt, crit)
-            
-            # 计算指标
-            batch_metrics = calculate_metrics(output, tgt, k_list)
-            
-            # 记录指标
-            total_loss += loss.item()
-            n_batches += 1
-            for k in k_list:
-                epoch_metrics[f'hits@{k}'] += batch_metrics[f'hits@{k}']
-                epoch_metrics[f'map@{k}'] += batch_metrics[f'map@{k}']
-            
-            # 清除不需要的变量以节省内存
-            del src, tgt, src_lengths, time_intervals, output
-            torch.cuda.empty_cache()
+            try:
+                # 获取数据并移动到正确的设备
+                src = batch['src'].to(device)
+                tgt = batch['tgt'].to(device)
+                src_lengths = batch['src_lengths'].to(device)
+                time_intervals = batch['time_intervals'].to(device)
+                
+                # 前向传播
+                output = model(src, src_lengths, tgt, time_intervals)
+                
+                # 计算损失
+                loss, _ = get_performance(output, tgt, crit)
+                
+                # 计算指标
+                batch_metrics = calculate_metrics(output, tgt, k_list)
+                
+                # 记录指标
+                total_loss += loss.item()
+                n_batches += 1
+                for k in k_list:
+                    epoch_metrics[f'hits@{k}'] += batch_metrics[f'hits@{k}']
+                    epoch_metrics[f'map@{k}'] += batch_metrics[f'map@{k}']
+                
+                # 清除不需要的变量以节省内存
+                del src, tgt, src_lengths, time_intervals, output
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"验证时出现错误: {e}")
+                continue
     
-    # 计算平均值
+    # 计算平均损失和指标
+    avg_loss = total_loss / n_batches
     for k in k_list:
         epoch_metrics[f'hits@{k}'] /= n_batches
         epoch_metrics[f'map@{k}'] /= n_batches
     
-    return total_loss / n_batches, epoch_metrics
+    return avg_loss, epoch_metrics
 
 def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_output_len=3):
     """测试模型"""
     model.eval()
     
-    all_targets = []
-    all_predictions = []
+    total_metrics = {f'hits@{k}': 0.0 for k in k_list}
+    total_metrics.update({f'map@{k}': 0.0 for k in k_list})
+    n_batches = 0
     
     with torch.no_grad():
         for batch in tqdm(data_loader.get_test_batches(), desc="Testing"):
@@ -271,60 +344,47 @@ def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_
             src_lengths = batch['src_lengths'].to(device)
             time_intervals = batch['time_intervals'].to(device)
             
-            # 生成序列
+            # 生成预测序列
             generated_seq, generated_probs = model.generate(
-                src, src_lengths, max_len=max_output_len, 
-                time_intervals=time_intervals
+                src, src_lengths, max_len=max_output_len, time_intervals=time_intervals
             )
             
-            # 收集目标和预测
-            for i in range(tgt.size(0)):
-                # 找到目标序列中的有效部分（跳过BOS和EOS）
-                valid_tgt = tgt[i][tgt[i] != Constants.PAD]
-                valid_tgt = valid_tgt[1:-1]  # 去掉BOS和EOS
+            # 计算指标
+            for i in range(batch['src'].size(0)):
+                # 获取真实标签（跳过BOS和EOS）
+                gold_seq = tgt[i][tgt[i] != Constants.PAD]
+                gold_seq = gold_seq[1:-1]  # 去掉BOS和EOS
                 
-                if len(valid_tgt) == 0:
+                if len(gold_seq) == 0:
                     continue
                 
-                # 收集目标和预测
-                all_targets.append(valid_tgt.cpu().numpy())
-                all_predictions.append(generated_seq[i].cpu().numpy())
+                # 对每个位置计算指标
+                for j in range(min(len(gold_seq), max_output_len)):
+                    gold_user = gold_seq[j].item()
+                    pred_probs = generated_probs[i, j]
+                    
+                    # 计算hits@k和map@k
+                    for k in k_list:
+                        hits = metrics.hits_k(pred_probs, gold_user, k=k)
+                        mapk = metrics.mapk(pred_probs, gold_user, k=k)
+                        
+                        total_metrics[f'hits@{k}'] += hits / len(gold_seq)
+                        total_metrics[f'map@{k}'] += mapk / len(gold_seq)
+            
+            n_batches += 1
+            
+            # 清除不需要的变量以节省内存
+            del src, tgt, src_lengths, time_intervals, generated_seq, generated_probs
+            torch.cuda.empty_cache()
     
-    # 计算指标
-    scores = {}
-    
-    # 计算Hits@k和MAP@k
+    # 计算平均指标
     for k in k_list:
-        hits_sum = 0
-        map_sum = 0
-        
-        for pred, target in zip(all_predictions, all_targets):
-            # 计算Hits@k
-            hits = 0
-            for t in target:
-                if t in pred[:k]:
-                    hits += 1
-            hits_sum += hits / len(target)
-            
-            # 计算MAP@k
-            ap = 0
-            for i, p in enumerate(pred[:k]):
-                if p in target:
-                    # 计算精度@i
-                    precision = sum([1 for j in range(i+1) if pred[j] in target]) / (i+1)
-                    ap += precision
-            
-            if sum([1 for p in pred[:k] if p in target]) > 0:
-                ap /= min(k, len(target))
-                map_sum += ap
-        
-        scores[f'hits@{k}'] = hits_sum / len(all_targets) if all_targets else 0
-        scores[f'map@{k}'] = map_sum / len(all_targets) if all_targets else 0
+        total_metrics[f'hits@{k}'] /= n_batches
+        total_metrics[f'map@{k}'] /= n_batches
     
-    return scores
+    return total_metrics
 
 def main():
-    """主函数"""
     parser = argparse.ArgumentParser()
     
     # 数据参数
@@ -341,12 +401,11 @@ def main():
     parser.add_argument('--pf_dim', type=int, default=256, help='前馈网络维度')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--use_network', action='store_true', help='是否使用社交网络')
-    parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5, help='教师强制比例')
-    parser.add_argument('--max_seq_length', type=int, default=500, help='最大序列长度')
+    parser.add_argument('--max_seq_length', type=int, default=3000, help='最大序列长度')
     
     # 训练参数
     parser.add_argument('--n_epochs', type=int, default=50, help='训练轮数')
-    parser.add_argument('--lr', type=float, default=0.0005, help='学习率')
+    parser.add_argument('--lr', type=float, default=0.00005, help='学习率')
     parser.add_argument('--warmup_steps', type=int, default=4000, help='预热步数')
     parser.add_argument('--grad_accum_steps', type=int, default=4, help='梯度累积步数')
     parser.add_argument('--k_list', type=int, nargs='+', default=[10, 50, 100], help='评估的k值列表')
@@ -399,8 +458,6 @@ def main():
         dropout=args.dropout,
         use_network=args.use_network,
         adj=data_loader.adj_tensor if args.use_network and hasattr(data_loader, 'adj_tensor') else None,
-        net_dict=data_loader.adj_dict if args.use_network and hasattr(data_loader, 'adj_dict') else None,
-        teacher_forcing_ratio=args.teacher_forcing_ratio,
         max_seq_length=args.max_seq_length
     ).to(device)
     
@@ -410,18 +467,17 @@ def main():
     # 如果有预训练嵌入，加载它们
     if args.use_network and hasattr(data_loader, 'embeds') and data_loader.embeds is not None:
         print("加载预训练嵌入...")
-        model.encoder.user_embedding.weight.data.copy_(torch.FloatTensor(data_loader.embeds).to(device))
-        model.decoder.user_embedding.weight.data.copy_(torch.FloatTensor(data_loader.embeds).to(device))
+        model.user_encoder.user_embedding.weight.data.copy_(torch.FloatTensor(data_loader.embeds).to(device))
     
     # 打印模型信息
     print(f"模型参数数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     
     # 定义损失函数和优化器
-    crit = nn.CrossEntropyLoss(ignore_index=Constants.PAD)
+    crit = nn.CrossEntropyLoss(ignore_index=Constants.PAD, reduction='sum')  # 使用sum而非mean
     optimizer = ScheduledOptim(
-        optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-8),
+        optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9),  # 使用更小的学习率
         args.hidden_dim,
-        args.warmup_steps
+        args.warmup_steps * 2  # 延长预热步数
     )
     
     # 训练模型

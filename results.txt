@@ -10,47 +10,14 @@ n_heads: 4
 pf_dim: 256
 dropout: 0.1
 use_network: False
-teacher_forcing_ratio: 0.5
-max_seq_length: 500
+max_seq_length: 3000
 n_epochs: 50
-lr: 0.0005
+lr: 5e-05
 warmup_steps: 4000
 grad_accum_steps: 4
 k_list: [10, 50, 100]
 seed: 42
-cuda: False
+cuda: True
 save_dir: checkpoints
 results_file: results.txt
-
-Epoch 1:
-Train Loss: 10.4483
-Train Hits@10: 0.0006
-Train MAP@10: 0.0002
-Train Hits@50: 0.0047
-Train MAP@50: 0.0004
-Train Hits@100: 0.0067
-Train MAP@100: 0.0004
-Valid Loss: 10.4438
-Valid Hits@10: 0.0000
-Valid MAP@10: 0.0000
-Valid Hits@50: 0.0028
-Valid MAP@50: 0.0001
-Valid Hits@100: 0.0038
-Valid MAP@100: 0.0001
-
-Epoch 2:
-Train Loss: 10.4438
-Train Hits@10: 0.0006
-Train MAP@10: 0.0002
-Train Hits@50: 0.0048
-Train MAP@50: 0.0004
-Train Hits@100: 0.0067
-Train MAP@100: 0.0004
-Valid Loss: 10.4438
-Valid Hits@10: 0.0000
-Valid MAP@10: 0.0000
-Valid Hits@50: 0.0028
-Valid MAP@50: 0.0001
-Valid Hits@100: 0.0038
-Valid MAP@100: 0.0001
 
