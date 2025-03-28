@@ -144,13 +144,16 @@ def get_performance(pred, gold, crit):
     return ce_loss, ce_loss
 
 def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
-    """计算评估指标，确保安全处理"""
+    """计算评估指标，确保正确处理"""
     batch_metrics = {f'hits@{k}': 0.0 for k in k_list}
     batch_metrics.update({f'map@{k}': 0.0 for k in k_list})
     
     batch_size = gold.size(0)
     if batch_size == 0:
         return batch_metrics
+    
+    # 计数有效样本
+    valid_samples = 0
     
     # 跳过BOS位置，只评估预测位置
     for pos in range(1, min(4, gold.size(1))):
@@ -163,6 +166,8 @@ def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
             if pos_gold[i] == Constants.PAD:
                 continue
                 
+            valid_samples += 1
+            
             # 获取当前样本的预测和真实标签
             sample_pred = pos_pred[i].detach().cpu().numpy()
             sample_gold = pos_gold[i].item()
@@ -173,20 +178,27 @@ def calculate_metrics(pred, gold, k_list=[10, 50, 100]):
             
             # 计算各种指标
             for k in k_list:
-                try:
-                    batch_metrics[f'hits@{k}'] += metrics.hits_k(sample_pred, sample_gold, k=k)
-                    batch_metrics[f'map@{k}'] += metrics.mapk(sample_pred, sample_gold, k=k)
-                except Exception as e:
-                    print(f"计算指标出错: {e}")
+                # 获取top-k预测
+                top_indices = np.argsort(sample_pred)[-k:][::-1]
+                
+                # 计算hits@k - 如果真实标签在top-k中，则为1，否则为0
+                hit = 1.0 if sample_gold in top_indices else 0.0
+                batch_metrics[f'hits@{k}'] += hit
+                
+                # 计算MAP@k - 使用单样本的平均精度
+                ap = 0.0
+                if sample_gold in top_indices:
+                    # 找到真实标签在top-k中的位置
+                    idx = np.where(top_indices == sample_gold)[0][0]
+                    # 计算精度 = 1/(排名+1)
+                    ap = 1.0 / (idx + 1.0)
+                batch_metrics[f'map@{k}'] += ap
     
-    # 计算平均值
-    valid_count = sum(1 for i in range(batch_size) for pos in range(1, min(4, gold.size(1))) 
-                     if pos < gold.size(1) and gold[i, pos] != Constants.PAD)
-    
-    if valid_count > 0:
+    # 计算平均值 - 确保除以有效样本数
+    if valid_samples > 0:
         for k in k_list:
-            batch_metrics[f'hits@{k}'] /= valid_count
-            batch_metrics[f'map@{k}'] /= valid_count
+            batch_metrics[f'hits@{k}'] /= valid_samples
+            batch_metrics[f'map@{k}'] /= valid_samples
     
     return batch_metrics
 
@@ -195,6 +207,7 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
     model.train()
     total_loss = 0.0
     n_batches = 0
+    total_samples = 0
     metrics_dict = {f'hits@{k}': 0.0 for k in k_list}
     metrics_dict.update({f'map@{k}': 0.0 for k in k_list})
     
@@ -214,24 +227,26 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
             # 计算损失
             loss, ce_loss = get_performance(output, tgt, crit)
             
-            # 检查损失是否为NaN
-            if torch.isnan(loss):
-                print("警告：损失为NaN，跳过此批次...")
-                continue
-            
-            # 计算梯度
+            # 反向传播
             loss = loss / gradient_accumulation_steps  # 梯度累积
             loss.backward()
             
             # 梯度累积：每处理N个批次才更新一次参数
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                # 使用更合理的梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # 极度激进的梯度裁剪
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.001)
                 
                 # 检查并修复梯度
-                for param in model.parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        # 将NaN梯度替换为0
                         param.grad = torch.where(torch.isnan(param.grad), torch.zeros_like(param.grad), param.grad)
+                        # 将过大的梯度缩小
+                        param.grad = torch.where(
+                            param.grad.abs() > 0.001,
+                            param.grad.sign() * 0.001,
+                            param.grad
+                        )
                 
                 # 更新参数
                 optimizer.step()
@@ -239,18 +254,18 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
                 optimizer.zero_grad()
             
             # 计算指标
-            try:
-                batch_metrics = calculate_metrics(output, tgt, k_list)
-                
-                # 累加损失和指标
-                total_loss += ce_loss.item()
-                for k in k_list:
-                    metrics_dict[f'hits@{k}'] += batch_metrics[f'hits@{k}']
-                    metrics_dict[f'map@{k}'] += batch_metrics[f'map@{k}']
-            except Exception as e:
-                print(f"计算指标出错: {e}")
-                # 仍然累加损失
-                total_loss += ce_loss.item()
+            batch_metrics = calculate_metrics(output, tgt, k_list)
+            
+            # 计算有效样本数
+            valid_samples = sum(1 for i in range(tgt.size(0)) for pos in range(1, min(4, tgt.size(1))) 
+                               if pos < tgt.size(1) and tgt[i, pos] != Constants.PAD)
+            total_samples += valid_samples
+            
+            # 累加损失和指标
+            total_loss += ce_loss.item()
+            for k in k_list:
+                metrics_dict[f'hits@{k}'] += batch_metrics[f'hits@{k}'] * valid_samples
+                metrics_dict[f'map@{k}'] += batch_metrics[f'map@{k}'] * valid_samples
             
             n_batches += 1
             
@@ -263,25 +278,14 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
         del src, tgt, src_lengths, time_intervals, output, loss, ce_loss
         torch.cuda.empty_cache()
     
-    # 处理最后一批次（如果有）
-    if (batch_idx + 1) % gradient_accumulation_steps != 0:
-        # 使用更合理的梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        # 检查并修复梯度
-        for param in model.parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                param.grad = torch.where(torch.isnan(param.grad), torch.zeros_like(param.grad), param.grad)
-        
-        optimizer.step()
-        optimizer.update_learning_rate()
-        optimizer.zero_grad()
-    
     # 计算平均损失和指标
-    avg_loss = total_loss / n_batches
-    for k in k_list:
-        metrics_dict[f'hits@{k}'] /= n_batches
-        metrics_dict[f'map@{k}'] /= n_batches
+    avg_loss = total_loss / max(1, n_batches)
+    
+    # 确保除以总有效样本数
+    if total_samples > 0:
+        for k in k_list:
+            metrics_dict[f'hits@{k}'] /= total_samples
+            metrics_dict[f'map@{k}'] /= total_samples
     
     return avg_loss, metrics_dict
 

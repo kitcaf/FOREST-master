@@ -58,15 +58,7 @@ def apk(actual, predicted, k=10):
 
 def hits_k(y_prob, y, k=10):
     """
-    计算Hits@k指标
-    
-    参数:
-        y_prob: 预测概率或分数，形状为[n_classes]
-        y: 真实标签，单个标量
-        k: 考虑的前k个预测
-        
-    返回:
-        Hits@k分数 (1.0 或 0.0)
+    计算单个样本的Hits@k，添加安全检查
     """
     # 确保输入格式正确
     if isinstance(y_prob, torch.Tensor):
@@ -75,15 +67,23 @@ def hits_k(y_prob, y, k=10):
         y = y.detach().cpu().item()  # 转换为标量
     
     # 确保k不超过预测张量的维度
-    effective_k = min(k, y_prob.shape[0])
+    effective_k = min(k, len(y_prob))
     if effective_k <= 0:
         return 0.0
     
-    # 获取前k个预测的索引
-    top_indices = np.argsort(y_prob)[-effective_k:]
+    # 检查y_prob是否包含NaN或Inf
+    if np.isnan(y_prob).any() or np.isinf(y_prob).any():
+        y_prob = np.nan_to_num(y_prob, nan=0.0, posinf=1e6, neginf=-1e6)
     
-    # 检查真实标签是否在前k个预测中
-    return 1.0 if y in top_indices else 0.0
+    try:
+        # 获取前k个预测的索引
+        top_indices = np.argsort(y_prob)[-effective_k:][::-1]
+        
+        # 如果真实标签在top-k中，则为1，否则为0
+        return 1.0 if y in top_indices else 0.0
+    except Exception as e:
+        print(f"Hits@k计算出错: {e}")
+        return 0.0
 
 def mapk(y_prob, y, k=10):
     """
@@ -96,7 +96,7 @@ def mapk(y_prob, y, k=10):
         y = y.detach().cpu().item()  # 转换为标量
     
     # 确保k不超过预测张量的维度
-    effective_k = min(k, y_prob.shape[0])
+    effective_k = min(k, len(y_prob))
     if effective_k <= 0:
         return 0.0
     
@@ -105,10 +105,8 @@ def mapk(y_prob, y, k=10):
         y_prob = np.nan_to_num(y_prob, nan=0.0, posinf=1e6, neginf=-1e6)
     
     try:
-        # 使用部分排序而非完全排序，提高效率
-        top_indices = np.argpartition(y_prob, -effective_k)[-effective_k:]
-        # 对这些顶部元素再排序
-        top_indices = top_indices[np.argsort(y_prob[top_indices])][::-1]
+        # 获取前k个预测的索引
+        top_indices = np.argsort(y_prob)[-effective_k:][::-1]
         
         # 计算AP@k
         actual = [y]  # 单个元素的列表
