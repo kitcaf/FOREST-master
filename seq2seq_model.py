@@ -112,118 +112,88 @@ class GraphConvolution(nn.Module):
         return output
 
 class UserEncoder(nn.Module):
-    """用户编码器：将用户ID映射为低维向量，融合社交图信息"""
+    """用户编码器：融合社交图信息"""
     def __init__(self, user_size, embed_dim, dropout=0.1, use_network=False, adj=None):
         super(UserEncoder, self).__init__()
-        self.user_size = user_size
-        self.embed_dim = embed_dim
-        self.use_network = use_network
         
-        # 用户嵌入层，使用Xavier初始化增强稳定性
+        # 用户嵌入层
         self.user_embedding = nn.Embedding(user_size, embed_dim)
-        nn.init.xavier_uniform_(self.user_embedding.weight, gain=0.1)  # 使用较小的gain值
+        
+        # 使用更合理的初始化
+        nn.init.normal_(self.user_embedding.weight, mean=0, std=0.1)
+        
+        # dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # 是否使用社交网络
+        self.use_network = use_network
         
         # 如果使用社交网络，添加图卷积层
         if use_network and adj is not None:
-            self.gcn = GraphConvolution(embed_dim, embed_dim)
-            self.register_buffer('adj', adj)
+            self.adj = adj
+            self.gcn = nn.Linear(embed_dim, embed_dim)
+            nn.init.xavier_uniform_(self.gcn.weight, gain=0.1)
+            nn.init.zeros_(self.gcn.bias)
         
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-        
-    def forward(self, user_ids):
+    def forward(self, src):
         """
         参数:
-            user_ids: 用户ID序列 [batch_size, seq_len]
+            src: 源序列 [batch_size, src_len]
         返回:
-            user_embeds: 用户嵌入 [batch_size, seq_len, embed_dim]
+            embedded: 嵌入后的序列 [batch_size, src_len, embed_dim]
         """
-        # 获取用户嵌入
-        user_embeds = self.user_embedding(user_ids)  # [batch_size, seq_len, embed_dim]
+        # 应用嵌入
+        embedded = self.user_embedding(src)
         
-        # 应用图卷积（如果启用）
+        # 如果使用社交网络，应用图卷积
         if self.use_network and hasattr(self, 'adj'):
-            # 对每个位置应用GCN
-            batch_size, seq_len, _ = user_embeds.size()
+            batch_size, seq_len, embed_dim = embedded.size()
             
-            # 重塑为[batch_size * seq_len, embed_dim]以便应用GCN
-            user_embeds_flat = user_embeds.view(-1, self.embed_dim)
+            # 展平嵌入
+            flat_embedded = embedded.view(-1, embed_dim)
             
-            # 应用GCN，确保数值稳定性
-            try:
-                user_embeds_flat = self.gcn(user_embeds_flat, self.adj)
-                
-                # 检查NaN并修复
-                if torch.isnan(user_embeds_flat).any():
-                    print("GCN输出包含NaN，使用原始嵌入...")
-                    user_embeds_flat = self.user_embedding(user_ids).view(-1, self.embed_dim)
-            except Exception as e:
-                print(f"GCN计算出错: {e}")
-                user_embeds_flat = self.user_embedding(user_ids).view(-1, self.embed_dim)
+            # 应用图卷积
+            gcn_embedded = self.gcn(flat_embedded)
             
-            # 重塑回[batch_size, seq_len, embed_dim]
-            user_embeds = user_embeds_flat.view(batch_size, seq_len, self.embed_dim)
+            # 重塑回原始形状
+            embedded = gcn_embedded.view(batch_size, seq_len, embed_dim)
         
-        # 应用层归一化和dropout
-        user_embeds = self.layer_norm(user_embeds)
-        user_embeds = self.dropout(user_embeds)
+        # 应用dropout
+        embedded = self.dropout(embedded)
         
-        return user_embeds
+        return embedded
 
 class TemporalGraphEncoder(nn.Module):
-    """时序-图联合编码器：使用LSTM/GRU替代Transformer"""
-    def __init__(self, embed_dim, hidden_dim, n_layers=2, dropout=0.1, max_seq_length=3000, rnn_type='GRU'):
+    """时序-图联合编码器：使用RNN编码时序信息"""
+    def __init__(self, embed_dim, hidden_dim, n_layers=1, dropout=0.1, max_seq_length=3000, rnn_type='GRU'):
         super(TemporalGraphEncoder, self).__init__()
         
-        # 位置编码
-        self.pos_encoder = PositionalEncoding(embed_dim, max_seq_length, dropout)
+        # 选择RNN类型
+        rnn_class = nn.GRU if rnn_type == 'GRU' else nn.LSTM
         
-        # 时间间隔编码
-        self.time_encoder = TimeIntervalEncoding(embed_dim, dropout)
+        # 使用双向RNN
+        self.rnn = rnn_class(
+            input_size=embed_dim,
+            hidden_size=hidden_dim // 2,  # 因为是双向的，所以隐藏维度减半
+            num_layers=n_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if n_layers > 1 else 0
+        )
         
-        # 输入归一化
-        self.input_norm = nn.LayerNorm(embed_dim)
-        
-        # 使用双向GRU/LSTM
-        self.rnn_type = rnn_type
-        if rnn_type == 'LSTM':
-            self.rnn = nn.LSTM(
-                input_size=embed_dim,
-                hidden_size=hidden_dim // 2,  # 双向所以减半
-                num_layers=n_layers,
-                batch_first=True,
-                bidirectional=True,
-                dropout=dropout if n_layers > 1 else 0
-            )
-        else:  # 默认使用GRU
-            self.rnn = nn.GRU(
-                input_size=embed_dim,
-                hidden_size=hidden_dim // 2,  # 双向所以减半
-                num_layers=n_layers,
-                batch_first=True,
-                bidirectional=True,
-                dropout=dropout if n_layers > 1 else 0
-            )
-        
-        # 输出投影
-        self.output_projection = nn.Linear(hidden_dim, hidden_dim)
-        
-        # 层归一化
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-        # 初始化RNN权重
-        self._init_weights()
-        
-    def _init_weights(self):
-        """使用保守的初始化方式"""
+        # 使用更合理的初始化
         for name, param in self.rnn.named_parameters():
             if 'weight' in name:
                 nn.init.xavier_uniform_(param, gain=0.1)
             elif 'bias' in name:
                 nn.init.zeros_(param)
-    
+        
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+        # dropout
+        self.dropout = nn.Dropout(dropout)
+        
     def forward(self, x, mask, time_intervals=None):
         """
         参数:
@@ -233,88 +203,55 @@ class TemporalGraphEncoder(nn.Module):
         返回:
             encoded: 编码后的序列 [batch_size, seq_len, hidden_dim]
         """
-        # 应用输入归一化
-        x = self.input_norm(x)
-        
-        # 应用位置编码
-        x = self.pos_encoder(x)
-        
-        # 应用时间间隔编码（如果提供）
-        if time_intervals is not None:
-            x = self.time_encoder(x, time_intervals)
-        
         # 获取有效长度
         lengths = mask.sum(dim=1).long()
-        
-        # 确保长度至少为1
         lengths = torch.clamp(lengths, min=1)
         
-        # 打包序列
-        try:
-            packed_x = nn.utils.rnn.pack_padded_sequence(
-                x, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-            
-            # 应用RNN
-            if self.rnn_type == 'LSTM':
-                packed_output, _ = self.rnn(packed_x)
-            else:
-                packed_output, _ = self.rnn(packed_x)
-            
-            # 解包序列
-            output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
-            
-            # 如果序列长度不匹配，进行填充
-            if output.size(1) < x.size(1):
-                padding = torch.zeros(
-                    x.size(0), x.size(1) - output.size(1), output.size(2),
-                    device=output.device
-                )
-                output = torch.cat([output, padding], dim=1)
-            
-            # 应用输出投影
-            encoded = self.output_projection(output)
-            
-            # 应用层归一化和dropout
-            encoded = self.layer_norm(encoded)
-            encoded = self.dropout(encoded)
-            
-            # 检查NaN并修复
-            if torch.isnan(encoded).any():
-                print("RNN输出包含NaN，应用修复...")
-                encoded = torch.nan_to_num(encoded, nan=0.0)
-                
-                # 如果仍然有NaN，使用输入作为后备
-                if torch.isnan(encoded).any():
-                    print("使用输入作为后备...")
-                    encoded = self.output_projection(x)
-                    encoded = self.layer_norm(encoded)
+        # 应用dropout
+        x = self.dropout(x)
         
-        except Exception as e:
-            print(f"RNN计算出错: {e}")
-            # 使用输入作为后备
-            encoded = self.output_projection(x)
-            encoded = self.layer_norm(encoded)
+        # 打包序列
+        packed_x = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        
+        # 应用RNN
+        packed_output, _ = self.rnn(packed_x)
+        
+        # 解包序列
+        output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
+        
+        # 如果序列长度不匹配，进行填充
+        if output.size(1) < x.size(1):
+            padding = torch.zeros(
+                x.size(0), x.size(1) - output.size(1), output.size(2),
+                device=output.device
+            )
+            output = torch.cat([output, padding], dim=1)
+        
+        # 应用层归一化和dropout
+        encoded = self.layer_norm(output)
+        encoded = self.dropout(encoded)
         
         return encoded
 
 class EfficientDecoder(nn.Module):
-    """高效解码器：基于联合特征预测未来用户"""
+    """解码器：基于联合特征预测未来用户"""
     def __init__(self, hidden_dim, user_size, dropout=0.1):
         super(EfficientDecoder, self).__init__()
         
-        # 极度简化架构，只使用一个线性层
+        # 使用更合理的初始化
         self.output_layer = nn.Linear(hidden_dim, user_size)
         
-        # 使用极小的初始化值
-        with torch.no_grad():
-            self.output_layer.weight.data.fill_(0.0)
-            # 使用均匀分布初始化，范围非常小
-            self.output_layer.weight.data.uniform_(-0.001, 0.001)
-            self.output_layer.bias.data.fill_(0.0)
+        # 使用Xavier初始化，但缩小范围
+        nn.init.xavier_uniform_(self.output_layer.weight, gain=0.1)
+        nn.init.zeros_(self.output_layer.bias)
         
         # 层归一化
         self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+        # 添加位置编码
+        self.position_embedding = nn.Embedding(4, hidden_dim)  # 最多4个位置
         
         self.dropout = nn.Dropout(dropout)
         
@@ -337,27 +274,26 @@ class EfficientDecoder(nn.Module):
             if last_pos >= 0:
                 last_hidden[i] = encoder_output[i, last_pos]
         
-        # 应用层归一化和dropout
+        # 应用层归一化
         last_hidden = self.layer_norm(last_hidden)
-        last_hidden = self.dropout(last_hidden)
-        
-        # 缩放隐藏状态以减小数值范围
-        last_hidden = last_hidden * 0.1
         
         # 创建输出张量
         outputs = torch.zeros(batch_size, 3, user_size, device=encoder_output.device)
         
         # 对每个时间步分别生成输出
         for t in range(3):
-            # 使用相同的隐藏状态，但添加极小的位置偏移
-            time_offset = torch.zeros_like(last_hidden)
-            time_offset[:, :5] = 0.01 * (t + 1)  # 只在前5个维度添加极小偏移
+            # 获取位置编码
+            pos_embed = self.position_embedding(torch.tensor(t+1, device=encoder_output.device))
+            pos_embed = pos_embed.expand(batch_size, -1)  # [batch_size, hidden_dim]
             
-            # 生成当前时间步的输出
-            current_hidden = last_hidden + time_offset
+            # 将位置编码添加到隐藏状态
+            current_hidden = last_hidden + pos_embed * 0.1
             
-            # 应用输出层，极度缩放logits以提高稳定性
-            logits = self.output_layer(current_hidden) * 0.01
+            # 应用dropout
+            current_hidden = self.dropout(current_hidden)
+            
+            # 应用输出层
+            logits = self.output_layer(current_hidden)
             
             outputs[:, t] = logits
         
@@ -408,7 +344,7 @@ class ImprovedSeq2SeqModel(nn.Module):
         return (src != Constants.PAD).float()  # [batch_size, src_len]
     
     def forward(self, src, src_lengths, tgt=None, time_intervals=None):
-        """前向传播"""
+        """前向传播，确保输出和目标对齐"""
         batch_size = src.size(0)
         
         # 创建掩码
@@ -427,14 +363,26 @@ class ImprovedSeq2SeqModel(nn.Module):
             encoder_output, src_lengths
         )  # [batch_size, 3, user_size]
         
+        # 确定目标序列长度
+        tgt_len = 4  # 默认BOS + 3个预测位置
+        if tgt is not None:
+            tgt_len = tgt.size(1)
+        
         # 添加一个全零的第一个位置（对应BOS）
         bos_logits = torch.zeros(batch_size, 1, self.user_size, device=src.device)
         outputs = torch.cat([bos_logits, decoder_output], dim=1)  # [batch_size, 4, user_size]
         
-        # 如果需要，添加一个全零的最后一个位置（对应EOS）
-        if tgt is not None and tgt.size(1) > outputs.size(1):
-            eos_logits = torch.zeros(batch_size, tgt.size(1) - outputs.size(1), self.user_size, device=src.device)
-            outputs = torch.cat([outputs, eos_logits], dim=1)  # [batch_size, tgt_len, user_size]
+        # 如果需要，调整输出长度以匹配目标
+        if tgt_len > outputs.size(1):
+            # 添加额外的位置
+            padding = torch.zeros(
+                batch_size, tgt_len - outputs.size(1), self.user_size, 
+                device=src.device
+            )
+            outputs = torch.cat([outputs, padding], dim=1)
+        elif tgt_len < outputs.size(1):
+            # 截断多余的位置
+            outputs = outputs[:, :tgt_len, :]
         
         return outputs
     
