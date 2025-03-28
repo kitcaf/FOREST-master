@@ -87,15 +87,7 @@ def hits_k(y_prob, y, k=10):
 
 def mapk(y_prob, y, k=10):
     """
-    计算单个样本的Average Precision@k
-    
-    参数:
-        y_prob: 预测概率或分数，形状为[n_classes]
-        y: 真实标签，单个标量
-        k: 考虑的前k个预测
-        
-    返回:
-        AP@k分数
+    计算单个样本的Average Precision@k，添加安全检查
     """
     # 确保输入格式正确
     if isinstance(y_prob, torch.Tensor):
@@ -108,12 +100,22 @@ def mapk(y_prob, y, k=10):
     if effective_k <= 0:
         return 0.0
     
-    # 获取前k个预测的索引
-    top_indices = np.argsort(y_prob)[-effective_k:][::-1]
+    # 检查y_prob是否包含NaN或Inf
+    if np.isnan(y_prob).any() or np.isinf(y_prob).any():
+        y_prob = np.nan_to_num(y_prob, nan=0.0, posinf=1e6, neginf=-1e6)
     
-    # 计算AP@k
-    actual = [y]  # 单个元素的列表
-    return apk(actual, top_indices, k)
+    try:
+        # 使用部分排序而非完全排序，提高效率
+        top_indices = np.argpartition(y_prob, -effective_k)[-effective_k:]
+        # 对这些顶部元素再排序
+        top_indices = top_indices[np.argsort(y_prob[top_indices])][::-1]
+        
+        # 计算AP@k
+        actual = [y]  # 单个元素的列表
+        return apk(actual, top_indices, k)
+    except Exception as e:
+        print(f"MAP计算出错: {e}")
+        return 0.0
 
 
 def mean_rank(y_prob, y):
