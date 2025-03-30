@@ -6,6 +6,7 @@ import Constants
 import pickle
 import scipy.sparse as sp
 import gc
+import os
 
 from seq2seq_model import normalize, sparse_mx_to_torch_sparse_tensor
 
@@ -64,6 +65,16 @@ class Seq2SeqDataLoader:
         
         # 创建数据批次
         self._create_batches()
+        
+        # 确保时间间隔属性存在
+        if not hasattr(self, 'train_intervals'):
+            self.train_intervals = [self._create_default_intervals(cascade) for cascade in self.train_cascades]
+        
+        if not hasattr(self, 'valid_intervals'):
+            self.valid_intervals = [self._create_default_intervals(cascade) for cascade in self.valid_cascades]
+        
+        if not hasattr(self, 'test_intervals'):
+            self.test_intervals = [self._create_default_intervals(cascade) for cascade in self.test_cascades]
         
     def _load_user_index(self):
         """加载用户索引映射"""
@@ -148,6 +159,11 @@ class Seq2SeqDataLoader:
         self.valid_cascades, self.valid_timestamps = self._read_cascades(self.valid_data_path)
         self.test_cascades, self.test_timestamps = self._read_cascades(self.test_data_path)
         
+        # 计算时间间隔
+        self.train_intervals = self._calculate_time_intervals(self.train_timestamps)
+        self.valid_intervals = self._calculate_time_intervals(self.valid_timestamps)
+        self.test_intervals = self._calculate_time_intervals(self.test_timestamps)
+        
         print(f"训练集大小: {len(self.train_cascades)}")
         print(f"验证集大小: {len(self.valid_cascades)}")
         print(f"测试集大小: {len(self.test_cascades)}")
@@ -156,6 +172,11 @@ class Seq2SeqDataLoader:
         """读取级联数据"""
         cascades = []
         timestamps = []
+        
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            print(f"警告: 找不到文件 {file_path}，返回空列表")
+            return [], []
         
         for line in open(file_path):
             if len(line.strip()) == 0:
@@ -166,20 +187,28 @@ class Seq2SeqDataLoader:
             timestamp = []
             
             for chunk in chunks:
-                user, time = chunk.split(',')
-                
-                # 将用户名转换为ID
-                if user in self._u2idx:
-                    user_id = self._u2idx[user]
-                else:
-                    user_id = self._u2idx['<unk>']
-                
-                # 将时间转换为浮点数
-                time = float(time)
-                
-                cascade.append(user_id)
-                timestamp.append(time)
+                if ',' in chunk:  # 确保格式正确
+                    try:
+                        user, time = chunk.split(',')
+                        
+                        # 将用户名转换为ID
+                        if user in self._u2idx:
+                            user_id = self._u2idx[user]
+                        else:
+                            user_id = self._u2idx.get('<unk>', 0)
+                        
+                        # 将时间转换为浮点数
+                        time = float(time)
+                        
+                        cascade.append(user_id)
+                        timestamp.append(time)
+                    except Exception as e:
+                        print(f"警告: 解析 '{chunk}' 时出错: {e}")
             
+            # 如果级联为空，跳过
+            if not cascade:
+                continue
+                
             # 如果指定了最大长度，截断过长的级联
             if max_len is not None and len(cascade) > max_len:
                 cascade = cascade[:max_len]
@@ -195,6 +224,10 @@ class Seq2SeqDataLoader:
         intervals = []
         
         for ts in timestamps:
+            if not ts:  # 如果时间戳列表为空
+                intervals.append([])
+                continue
+                
             interval = [0.0]  # 第一个用户的时间间隔为0
             
             for i in range(1, len(ts)):
@@ -280,76 +313,84 @@ class Seq2SeqDataLoader:
         return embeds
     
     def _create_batches(self):
-        """创建训练、验证和测试批次"""
-        # 计算时间间隔
-        self.train_intervals = self._calculate_time_intervals(self.train_timestamps)
-        self.valid_intervals = self._calculate_time_intervals(self.valid_timestamps)
-        self.test_intervals = self._calculate_time_intervals(self.test_timestamps)
+        """创建数据批次"""
+        print("创建数据批次...")
         
-        self.train_batches = self._create_seq2seq_batches(self.train_cascades, self.train_intervals)
-        self.valid_batches = self._create_seq2seq_batches(self.valid_cascades, self.valid_intervals)
-        self.test_batches = self._create_seq2seq_batches(self.test_cascades, self.test_intervals)
-    
-    def _create_seq2seq_batches(self, cascades, intervals):
-        """创建序列到序列批次"""
-        # 将级联和时间间隔配对
-        paired_data = list(zip(cascades, intervals))
-        
-        # 过滤掉长度小于等于3的级联
-        paired_data = [pair for pair in paired_data if len(pair[0]) > 3]
-        
-        if not paired_data:
-            return []
-        
-        # 根据级联长度排序
-        sorted_data = sorted(paired_data, key=lambda x: len(x[0]))
-        
-        # 创建批次
-        batches = []
-        current_batch = []
-        
-        for cascade, interval in sorted_data:
-            if len(current_batch) == self.batch_size:
-                batch = self._prepare_seq2seq_batch([item[0] for item in current_batch], 
-                                                  [item[1] for item in current_batch])
-                if batch is not None:
-                    batches.append(batch)
-                current_batch = []
+        # 训练批次
+        self.train_batches = []
+        for i in range(0, len(self.train_cascades), self.batch_size):
+            # 确保索引有效
+            end_idx = min(i + self.batch_size, len(self.train_cascades))
             
-            current_batch.append((cascade, interval))
-        
-        # 添加最后一个批次
-        if current_batch:
-            batch = self._prepare_seq2seq_batch([item[0] for item in current_batch], 
-                                              [item[1] for item in current_batch])
+            # 确保train_intervals存在且长度匹配
+            if not hasattr(self, 'train_intervals') or len(self.train_intervals) < end_idx:
+                print("警告: train_intervals不存在或长度不匹配，创建默认间隔")
+                self.train_intervals = [self._create_default_intervals(c) for c in self.train_cascades]
+            
+            batch = self._create_batch(
+                self.train_cascades[i:end_idx], 
+                self.train_intervals[i:end_idx]
+            )
             if batch is not None:
-                batches.append(batch)
+                self.train_batches.append(batch)
         
-        # 打乱批次顺序
-        if self.shuffle:
-            random.shuffle(batches)
+        # 验证批次
+        self.valid_batches = []
+        for i in range(0, len(self.valid_cascades), self.batch_size):
+            # 确保索引有效
+            end_idx = min(i + self.batch_size, len(self.valid_cascades))
+            
+            # 确保valid_intervals存在且长度匹配
+            if not hasattr(self, 'valid_intervals') or len(self.valid_intervals) < end_idx:
+                print("警告: valid_intervals不存在或长度不匹配，创建默认间隔")
+                self.valid_intervals = [self._create_default_intervals(c) for c in self.valid_cascades]
+            
+            batch = self._create_batch(
+                self.valid_cascades[i:end_idx], 
+                self.valid_intervals[i:end_idx]
+            )
+            if batch is not None:
+                self.valid_batches.append(batch)
         
-        return batches
-    
-    def _prepare_seq2seq_batch(self, cascades, intervals, split_ratio=None):
-        """准备序列到序列批次，输入是原序列长度-3，输出是后面3个节点"""
-        # 使用传入的分割比例或默认值
-        if split_ratio is None:
-            split_ratio = self.split_ratio
+        # 测试批次
+        self.test_batches = []
+        for i in range(0, len(self.test_cascades), self.batch_size):
+            # 确保索引有效
+            end_idx = min(i + self.batch_size, len(self.test_cascades))
+            
+            # 确保test_intervals存在且长度匹配
+            if not hasattr(self, 'test_intervals') or len(self.test_intervals) < end_idx:
+                print("警告: test_intervals不存在或长度不匹配，创建默认间隔")
+                self.test_intervals = [self._create_default_intervals(c) for c in self.test_cascades]
+            
+            batch = self._create_batch(
+                self.test_cascades[i:end_idx], 
+                self.test_intervals[i:end_idx]
+            )
+            if batch is not None:
+                self.test_batches.append(batch)
         
-        # 创建源序列和目标序列
+        print(f"创建了 {len(self.train_batches)} 个训练批次, {len(self.valid_batches)} 个验证批次, {len(self.test_batches)} 个测试批次")
+
+    def _create_batch(self, cascades, intervals):
+        """创建单个批次"""
         src_seqs = []
         tgt_seqs = []
-        src_lengths = []
         src_intervals = []
+        src_lengths = []
         
-        for cascade, interval in zip(cascades, intervals):
-            # 只处理长度大于3的级联
-            if len(cascade) <= 3:
+        for idx, (cascade, interval) in enumerate(zip(cascades, intervals)):
+            # 跳过太短的级联
+            if len(cascade) < 4:  # 至少需要1个输入和3个输出
                 continue
             
-            # 计算分割点：取除最后3个节点外的所有节点作为输入
-            split_point = len(cascade) - 3
+            # 确保interval长度与cascade匹配
+            if len(interval) < len(cascade):
+                # 如果时间间隔不足，用1.0填充
+                interval = interval + [1.0] * (len(cascade) - len(interval))
+            
+            # 动态分割点 - 使用70%作为输入，但至少保留3个节点作为目标
+            split_point = max(1, min(len(cascade) - 3, int(len(cascade) * 0.7)))
             
             # 创建源序列和目标序列
             src = cascade[:split_point]
@@ -359,17 +400,35 @@ class Seq2SeqDataLoader:
                 src = src[-self.max_seq_length:]  # 只保留最后max_seq_length个节点
                 interval = interval[-self.max_seq_length:]  # 相应地调整时间间隔
             
-            tgt = [Constants.BOS] + cascade[split_point:] + [Constants.EOS]  # 最后3个节点加上BOS和EOS
+            # 目标序列：BOS + 后续3个节点 + EOS
+            tgt_nodes = cascade[split_point:split_point+3]
+            # 如果目标节点不足3个，用PAD填充
+            while len(tgt_nodes) < 3:
+                tgt_nodes.append(Constants.PAD)
+            
+            tgt = [Constants.BOS] + tgt_nodes + [Constants.EOS]
             
             # 获取源序列的时间间隔
             src_interval = interval[:len(src)]
+            
+            # 确保时间间隔长度与源序列长度一致
+            if len(src_interval) < len(src):
+                # 如果时间间隔不足，用1.0填充
+                src_interval = src_interval + [1.0] * (len(src) - len(src_interval))
+            
+            # 对时间间隔进行归一化处理
+            max_interval = max(src_interval) if src_interval else 1.0
+            # 修复除零错误：确保max_interval不为零
+            if max_interval == 0:
+                max_interval = 1.0
+            normalized_interval = [i/max_interval for i in src_interval]
             
             # 记录源序列长度
             src_lengths.append(len(src))
             
             src_seqs.append(src)
             tgt_seqs.append(tgt)
-            src_intervals.append(src_interval)
+            src_intervals.append(normalized_interval)
         
         # 如果没有有效的级联，返回空批次
         if not src_seqs:
@@ -390,9 +449,6 @@ class Seq2SeqDataLoader:
         tgt_tensor = torch.LongTensor(tgt_seqs)
         src_lengths_tensor = torch.LongTensor(src_lengths)
         src_intervals_tensor = torch.FloatTensor(src_intervals)
-        
-        # 使用半精度浮点数减少内存使用
-        src_intervals_tensor = src_intervals_tensor.half().float()
         
         if self.cuda:
             src_tensor = src_tensor.cuda()
@@ -417,4 +473,9 @@ class Seq2SeqDataLoader:
     
     def get_test_batches(self):
         """获取测试批次"""
-        return self.test_batches 
+        return self.test_batches
+
+    def _create_default_intervals(self, cascade):
+        """创建默认的时间间隔（如果原始数据中没有时间信息）"""
+        # 默认使用均匀间隔
+        return [1.0] * len(cascade) 

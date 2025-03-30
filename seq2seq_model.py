@@ -5,11 +5,12 @@ import numpy as np
 import scipy.sparse as sp
 import math
 import Constants
+import random
 
 """
 改进的序列到序列模型:
     1. 用户编码器：融合社交图信息
-    2. 时序-图联合编码器：LSTM/GRU + 动态图特征注入
+    2. 时序-图联合编码器：LSTM + 动态图特征注入
     3. 高效解码器：预测未来3个用户
 """
 
@@ -111,57 +112,151 @@ class GraphConvolution(nn.Module):
             
         return output
 
+class GraphAttentionLayer(nn.Module):
+    """图注意力层"""
+    def __init__(self, in_features, out_features):
+        super(GraphAttentionLayer, self).__init__()
+        self.attn_fc = nn.Linear(in_features, out_features)
+        self.attn_dropout = nn.Dropout(0.1)
+        self.attn_leaky_relu = nn.LeakyReLU(0.2)
+        self.attn_softmax = nn.Softmax(dim=1)
+        
+    def forward(self, x, adj):
+        # x: [batch_size, seq_len, in_features]
+        # adj: [batch_size, seq_len, seq_len]
+        
+        attn_output = self.attn_fc(x)  # [batch_size, seq_len, out_features]
+        attn_output = self.attn_dropout(attn_output)
+        attn_output = self.attn_leaky_relu(attn_output)
+        
+        # 应用注意力掩码
+        attn_output = attn_output * adj
+        
+        # 归一化注意力
+        attn_output = self.attn_softmax(attn_output)
+        
+        return attn_output
+
 class UserEncoder(nn.Module):
-    """用户编码器：融合社交图信息"""
+    """User encoder that integrates social graph information"""
     def __init__(self, user_size, embed_dim, dropout=0.1, use_network=False, adj=None):
         super(UserEncoder, self).__init__()
         
-        # 用户嵌入层
-        self.user_embedding = nn.Embedding(user_size, embed_dim)
-        
-        # 使用更合理的初始化
-        nn.init.normal_(self.user_embedding.weight, mean=0, std=0.1)
-        
-        # dropout
+        self.user_embedding = nn.Embedding(user_size, embed_dim, padding_idx=Constants.PAD)
         self.dropout = nn.Dropout(dropout)
-        
-        # 是否使用社交网络
         self.use_network = use_network
         
-        # 如果使用社交网络，添加图卷积层
+        # Xavier initialization
+        nn.init.xavier_uniform_(self.user_embedding.weight)
+        
+        # Social network integration
         if use_network and adj is not None:
             self.adj = adj
-            self.gcn = nn.Linear(embed_dim, embed_dim)
-            nn.init.xavier_uniform_(self.gcn.weight, gain=0.1)
-            nn.init.zeros_(self.gcn.bias)
-        
-    def forward(self, src):
+            self.neighbor_aggregation = nn.Linear(embed_dim, embed_dim)
+            self.gate = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.Sigmoid()
+            )
+            self.layer_norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, x, mask=None):
         """
-        参数:
-            src: 源序列 [batch_size, src_len]
-        返回:
-            embedded: 嵌入后的序列 [batch_size, src_len, embed_dim]
+        Args:
+            x: User ID sequence [batch_size, seq_len]
+            mask: Mask [batch_size, seq_len]
+        Returns:
+            User embeddings [batch_size, seq_len, embed_dim]
         """
-        # 应用嵌入
-        embedded = self.user_embedding(src)
+        # Get user embeddings
+        user_embeds = self.user_embedding(x)  # [batch_size, seq_len, embed_dim]
         
-        # 如果使用社交网络，应用图卷积
+        # Apply social network integration if enabled
         if self.use_network and hasattr(self, 'adj'):
-            batch_size, seq_len, embed_dim = embedded.size()
+            batch_size, seq_len = x.size()
             
-            # 展平嵌入
-            flat_embedded = embedded.view(-1, embed_dim)
+            # Create enhanced embeddings with neighbor information
+            enhanced_user_embeds = torch.zeros_like(user_embeds)
             
-            # 应用图卷积
-            gcn_embedded = self.gcn(flat_embedded)
+            for i in range(batch_size):
+                for j in range(seq_len):
+                    uid = x[i, j].item()
+                    if uid != Constants.PAD:
+                        # Get original embedding
+                        original = user_embeds[i, j]
+                        
+                        # Aggregate neighbor embeddings
+                        neighbor_embed = self._aggregate_neighbors(uid)
+                        
+                        if neighbor_embed is not None:
+                            # Apply gating mechanism
+                            combined = torch.cat([original, neighbor_embed], dim=0)
+                            gate_value = self.gate(combined)
+                            enhanced_user_embeds[i, j] = gate_value * neighbor_embed + (1 - gate_value) * original
+                        else:
+                            enhanced_user_embeds[i, j] = original
+                    else:
+                        enhanced_user_embeds[i, j] = user_embeds[i, j]
             
-            # 重塑回原始形状
-            embedded = gcn_embedded.view(batch_size, seq_len, embed_dim)
+            # Apply layer normalization
+            user_embeds = self.layer_norm(enhanced_user_embeds)
         
-        # 应用dropout
-        embedded = self.dropout(embedded)
+        # Apply dropout
+        user_embeds = self.dropout(user_embeds)
         
-        return embedded
+        # Apply mask if provided
+        if mask is not None:
+            user_embeds = user_embeds * mask.unsqueeze(-1)
+        
+        return user_embeds
+    
+    def _aggregate_neighbors(self, user_id):
+        """Aggregate embeddings from user's neighbors"""
+        if not hasattr(self, 'adj') or user_id >= self.adj.size(0):
+            return None
+            
+        # Get neighbors from adjacency matrix
+        neighbors = torch.nonzero(self.adj[user_id]).squeeze(1)
+        
+        if neighbors.numel() == 0:
+            return None
+            
+        # Get neighbor embeddings
+        neighbor_embeds = self.user_embedding(neighbors)
+        
+        # Mean aggregation
+        agg_embed = torch.mean(neighbor_embeds, dim=0)
+        
+        # Process through linear layer
+        return self.neighbor_aggregation(agg_embed)
+
+class TimeEncoder(nn.Module):
+    """Time interval encoding module"""
+    def __init__(self, embed_dim, dropout=0.1):
+        super(TimeEncoder, self).__init__()
+        self.time_embedding = nn.Sequential(
+            nn.Linear(1, embed_dim // 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim // 2, embed_dim)
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        
+    def forward(self, time_intervals):
+        """
+        Args:
+            time_intervals: Time intervals [batch_size, seq_len]
+        Returns:
+            Time embeddings [batch_size, seq_len, embed_dim]
+        """
+        # Convert time intervals to embeddings
+        time_intervals = time_intervals.unsqueeze(-1).float()  # [batch_size, seq_len, 1]
+        time_embed = self.time_embedding(time_intervals)  # [batch_size, seq_len, embed_dim]
+        
+        # Apply layer normalization and dropout
+        time_embed = self.layer_norm(time_embed)
+        time_embed = self.dropout(time_embed)
+        
+        return time_embed
 
 class TemporalGraphEncoder(nn.Module):
     """时序-图联合编码器：使用RNN编码时序信息"""
@@ -310,18 +405,13 @@ class EfficientDecoder(nn.Module):
         
         return outputs
 
-class ImprovedSeq2SeqModel(nn.Module):
-    """改进的序列到序列模型"""
-    def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, n_heads=8, pf_dim=512, dropout=0.1, 
-                 use_network=False, adj=None, net_dict=None, teacher_forcing_ratio=0.5, max_seq_length=3000,
-                 rnn_type='GRU'):
-        super(ImprovedSeq2SeqModel, self).__init__()
+class SocialSeq2SeqModel(nn.Module):
+    """Sequence-to-sequence model with social graph integration"""
+    def __init__(self, user_size, embed_dim, hidden_dim, n_layers=2, dropout=0.1, 
+                 use_network=False, adj=None, teacher_forcing_ratio=0.5):
+        super(SocialSeq2SeqModel, self).__init__()
         
-        # 确保adj是稀疏张量
-        if adj is not None and not isinstance(adj, torch.sparse.FloatTensor):
-            print("警告：邻接矩阵不是稀疏张量，性能可能受影响")
-        
-        # 用户编码器
+        # User encoder
         self.user_encoder = UserEncoder(
             user_size=user_size,
             embed_dim=embed_dim,
@@ -330,128 +420,248 @@ class ImprovedSeq2SeqModel(nn.Module):
             adj=adj
         )
         
-        # 时序-图联合编码器（使用LSTM/GRU替代Transformer）
-        self.temporal_graph_encoder = TemporalGraphEncoder(
+        # Time encoder
+        self.time_encoder = TimeEncoder(
             embed_dim=embed_dim,
-            hidden_dim=hidden_dim,
-            n_layers=n_layers,
-            dropout=dropout,
-            max_seq_length=max_seq_length,
-            rnn_type=rnn_type
-        )
-        
-        # 高效解码器
-        self.efficient_decoder = EfficientDecoder(
-            hidden_dim=hidden_dim,
-            user_size=user_size,
             dropout=dropout
         )
         
+        # Encoder LSTM
+        self.encoder_lstm = nn.LSTM(
+            input_size=embed_dim * 2,  # User embedding + time embedding
+            hidden_size=hidden_dim,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0,
+            bidirectional=True
+        )
+        
+        # Decoder LSTM
+        self.decoder_lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_dim * 2,  # Match bidirectional encoder output
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0
+        )
+        
+        # Attention mechanism
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim * 2,
+            num_heads=8,
+            dropout=dropout
+        )
+        
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # Context + hidden state
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, user_size)
+        )
+        
+        # Initialize parameters
+        self._init_parameters()
+        
+        # Store attributes
         self.user_size = user_size
         self.hidden_dim = hidden_dim
+        self.teacher_forcing_ratio = teacher_forcing_ratio
         
+    def _init_parameters(self):
+        """Initialize model parameters"""
+        for name, param in self.named_parameters():
+            if 'weight' in name and 'embedding' not in name:
+                if len(param.shape) >= 2:  # Only apply Xavier init to matrices
+                    nn.init.xavier_uniform_(param, gain=0.1)
+                else:  # For vectors (like bias terms)
+                    nn.init.zeros_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+    
     def create_mask(self, src):
-        """创建源序列掩码"""
+        """Create source sequence mask"""
         return (src != Constants.PAD).float()  # [batch_size, src_len]
     
     def forward(self, src, src_lengths, tgt=None, time_intervals=None):
-        """前向传播，确保输出和目标对齐"""
+        """
+        Forward pass
+        
+        Args:
+            src: Source sequence [batch_size, src_len]
+            src_lengths: Source sequence lengths [batch_size]
+            tgt: Target sequence [batch_size, tgt_len]
+            time_intervals: Time intervals [batch_size, src_len]
+            
+        Returns:
+            outputs: Decoder outputs [batch_size, tgt_len-1, user_size]
+        """
         batch_size = src.size(0)
         
-        # 创建掩码
-        src_mask = self.create_mask(src)  # [batch_size, src_len]
+        # Create mask
+        src_mask = self.create_mask(src)
         
-        # 1. 用户编码
-        user_embeds = self.user_encoder(src)  # [batch_size, src_len, embed_dim]
+        # Encode users
+        user_embedded = self.user_encoder(src, src_mask)  # [batch_size, src_len, embed_dim]
         
-        # 2. 时序-图联合编码
-        encoder_output = self.temporal_graph_encoder(
-            user_embeds, src_mask, time_intervals
-        )  # [batch_size, src_len, hidden_dim]
+        # Encode time intervals
+        if time_intervals is not None:
+            time_embedded = self.time_encoder(time_intervals)  # [batch_size, src_len, embed_dim]
+        else:
+            # Create default time embeddings if not provided
+            time_embedded = torch.zeros_like(user_embedded)
         
-        # 3. 高效解码
-        decoder_output = self.efficient_decoder(
-            encoder_output, src_lengths
-        )  # [batch_size, 3, user_size]
+        # Concatenate user and time embeddings
+        encoder_input = torch.cat([user_embedded, time_embedded], dim=2)  # [batch_size, src_len, embed_dim*2]
         
-        # 确定目标序列长度
-        tgt_len = 4  # 默认BOS + 3个预测位置
+        # Pack padded sequence
+        packed_input = nn.utils.rnn.pack_padded_sequence(
+            encoder_input, 
+            src_lengths.cpu(), 
+            batch_first=True, 
+            enforce_sorted=False
+        )
+        
+        # Encoder forward pass
+        packed_outputs, (hidden, cell) = self.encoder_lstm(packed_input)
+        
+        # Unpack sequence
+        encoder_outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
+        
+        # Process bidirectional encoder hidden states
+        hidden = self._reshape_bidirectional_states(hidden, batch_size)
+        cell = self._reshape_bidirectional_states(cell, batch_size)
+        
+        # Determine target sequence length
+        tgt_len = 3  # Default: predict 3 future users
         if tgt is not None:
-            tgt_len = tgt.size(1)
+            tgt_len = tgt.size(1) - 1  # Exclude BOS token
         
-        # 添加一个全零的第一个位置（对应BOS）
-        bos_logits = torch.zeros(batch_size, 1, self.user_size, device=src.device)
-        outputs = torch.cat([bos_logits, decoder_output], dim=1)  # [batch_size, 4, user_size]
+        # Initialize decoder input with BOS token
+        decoder_input = torch.full((batch_size, 1), Constants.BOS, device=src.device)
         
-        # 如果需要，调整输出长度以匹配目标
-        if tgt_len > outputs.size(1):
-            # 添加额外的位置
-            padding = torch.zeros(
-                batch_size, tgt_len - outputs.size(1), self.user_size, 
-                device=src.device
-            )
-            outputs = torch.cat([outputs, padding], dim=1)
-        elif tgt_len < outputs.size(1):
-            # 截断多余的位置
-            outputs = outputs[:, :tgt_len, :]
+        # Create output tensor
+        outputs = torch.zeros(batch_size, tgt_len, self.user_size, device=src.device)
+        
+        # Decoder forward pass
+        for t in range(tgt_len):
+            # Get current input embedding
+            current_input = self.user_encoder.user_embedding(decoder_input)  # [batch_size, 1, embed_dim]
+            
+            # Decoder step
+            decoder_output, (hidden, cell) = self.decoder_lstm(current_input, (hidden, cell))
+            
+            # Attention mechanism
+            query = decoder_output.transpose(0, 1)  # [1, batch_size, hidden_dim*2]
+            key = encoder_outputs.transpose(0, 1)   # [src_len, batch_size, hidden_dim*2]
+            value = encoder_outputs.transpose(0, 1) # [src_len, batch_size, hidden_dim*2]
+            
+            # Apply attention
+            attn_output, _ = self.attention(query, key, value, key_padding_mask=(src_mask == 0))
+            attn_output = attn_output.transpose(0, 1)  # [batch_size, 1, hidden_dim*2]
+            
+            # Concatenate decoder output and attention context
+            combined = torch.cat([decoder_output, attn_output], dim=2)  # [batch_size, 1, hidden_dim*4]
+            
+            # Generate output
+            output = self.output_projection(combined).squeeze(1)  # [batch_size, user_size]
+            outputs[:, t] = output
+            
+            # Next input - teacher forcing or use prediction
+            if self.training and tgt is not None and random.random() < self.teacher_forcing_ratio:
+                # Teacher forcing - use real target
+                decoder_input = tgt[:, t+1].unsqueeze(1)  # [batch_size, 1]
+            else:
+                # Use model prediction
+                top1 = output.argmax(1).unsqueeze(1)  # [batch_size, 1]
+                decoder_input = top1
         
         return outputs
     
-    def generate(self, src, src_lengths, max_len=3, time_intervals=None, start_tokens=None):
-        """生成序列，固定生成3个节点"""
+    def _reshape_bidirectional_states(self, state, batch_size):
+        """Reshape bidirectional LSTM states for the decoder"""
+        num_layers = state.size(0) // 2
+        hidden_dim = state.size(2)
+        
+        # Reshape from [num_layers*2, batch_size, hidden_dim] to [num_layers, batch_size, hidden_dim*2]
+        # by concatenating forward and backward states
+        reshaped = torch.zeros(num_layers, batch_size, hidden_dim*2, device=state.device)
+        
+        for i in range(num_layers):
+            # Concatenate forward and backward states
+            forward_state = state[i*2]
+            backward_state = state[i*2+1]
+            reshaped[i] = torch.cat([forward_state, backward_state], dim=1)
+        
+        return reshaped
+    
+    def generate(self, src, src_lengths, max_len=3, time_intervals=None):
+        """
+        Generate sequence without teacher forcing
+        
+        Args:
+            src: Source sequence [batch_size, src_len]
+            src_lengths: Source sequence lengths [batch_size]
+            max_len: Maximum generation length
+            time_intervals: Time intervals [batch_size, src_len]
+            
+        Returns:
+            generated_seq: Generated sequence [batch_size, max_len]
+            generated_probs: Generated probabilities [batch_size, max_len, user_size]
+        """
         batch_size = src.size(0)
         
-        # 前向传播获取预测
-        with torch.no_grad():  # 使用无梯度模式提高稳定性
+        # Forward pass to get predictions
+        with torch.no_grad():
             outputs = self.forward(src, src_lengths, time_intervals=time_intervals)
         
-        # 提取预测结果（跳过BOS位置）
-        logits = outputs[:, 1:max_len+1]  # [batch_size, max_len, user_size]
+        # Extract prediction logits
+        logits = outputs  # [batch_size, max_len, user_size]
         
-        # 存储生成的序列
+        # Store generated sequence and probabilities
         generated_seq = torch.zeros(batch_size, max_len, dtype=torch.long, device=src.device)
         generated_probs = torch.zeros(batch_size, max_len, self.user_size, device=src.device)
         
-        # 已生成的用户集合（避免重复）
+        # Track generated users to avoid repetition
         generated_users = [set() for _ in range(batch_size)]
         
-        # 对每个位置进行预测
+        # Generate for each position
         for t in range(max_len):
-            # 获取当前位置的输出
+            # Get current position output
             step_output = logits[:, t].clone()  # [batch_size, user_size]
             
-            # 应用掩码防止生成已经出现过的用户
+            # Apply mask to prevent generating already seen users
             for i in range(batch_size):
-                for user_id in generated_users[i]:
-                    step_output[i, user_id] = float('-inf')
-                
-                # 也避免生成源序列中的用户
+                # Mask users from source sequence
                 for j in range(src.size(1)):
                     user_id = src[i, j].item()
                     if user_id != Constants.PAD:
                         step_output[i, user_id] = float('-inf')
+                
+                # Mask already generated users
+                for user_id in generated_users[i]:
+                    step_output[i, user_id] = float('-inf')
             
-            # 使用温度为0.7的softmax，增加多样性
+            # Apply softmax with temperature
             temperature = 0.7
             step_probs = F.softmax(step_output / temperature, dim=1)
             
-            # 检查NaN并修复
+            # Handle NaN values
             if torch.isnan(step_probs).any():
-                print(f"时间步{t}的概率分布包含NaN，应用修复...")
                 step_probs = torch.nan_to_num(step_probs, nan=0.0)
-                # 重新归一化
+                # Renormalize
                 step_probs = step_probs / (step_probs.sum(dim=1, keepdim=True) + 1e-10)
             
-            # 存储概率分布
+            # Store probabilities
             generated_probs[:, t] = step_probs
             
-            # 采样下一个用户
+            # Sample next user
             top1 = step_output.argmax(1)  # [batch_size]
             
-            # 存储生成的用户
+            # Store generated user
             generated_seq[:, t] = top1
             
-            # 更新已生成的用户集合
+            # Update generated users set
             for i in range(batch_size):
                 generated_users[i].add(top1[i].item())
         

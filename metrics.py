@@ -110,7 +110,7 @@ def mapk(y_prob, y, k=10):
         
         # 计算AP@k
         actual = [y]  # 单个元素的列表
-        return apk(actual, top_indices, k)
+        return apk(actual, top_indices.tolist(), k)
     except Exception as e:
         print(f"MAP计算出错: {e}")
         return 0.0
