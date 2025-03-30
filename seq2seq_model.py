@@ -236,7 +236,7 @@ class TemporalGraphEncoder(nn.Module):
         return encoded
 
 class EfficientDecoder(nn.Module):
-    """解码器：基于联合特征预测未来用户"""
+    """高效解码器：基于联合特征预测未来用户"""
     def __init__(self, hidden_dim, user_size, dropout=0.1):
         super(EfficientDecoder, self).__init__()
         
@@ -252,8 +252,13 @@ class EfficientDecoder(nn.Module):
         
         # 添加位置编码
         self.position_embedding = nn.Embedding(4, hidden_dim)  # 最多4个位置
+        nn.init.normal_(self.position_embedding.weight, mean=0, std=0.01)
         
+        # 增加dropout
         self.dropout = nn.Dropout(dropout)
+        
+        # 添加L2正则化
+        self.l2_reg = 1e-5
         
     def forward(self, encoder_output, src_lengths):
         """
@@ -294,6 +299,12 @@ class EfficientDecoder(nn.Module):
             
             # 应用输出层
             logits = self.output_layer(current_hidden)
+            
+            # 应用L2正则化
+            l2_loss = self.l2_reg * torch.norm(self.output_layer.weight, p=2)
+            if self.training:
+                # 在训练模式下添加正则化损失
+                logits = logits - l2_loss.expand_as(logits) * 0.01
             
             outputs[:, t] = logits
         

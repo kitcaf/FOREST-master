@@ -222,10 +222,14 @@ def train_epoch(model, data_loader, optimizer, crit, device, k_list=[10, 50, 100
         # 前向传播
         try:
             output = model(src, src_lengths, tgt, time_intervals)
-            # print("output结果", output.shape)
-            # print("tgt", tgt.shape)
+            
             # 计算损失
             loss, ce_loss = get_performance(output, tgt, crit)
+            
+            # 检查损失是否为NaN
+            if torch.isnan(loss):
+                print("警告：损失为NaN，跳过此批次...")
+                continue
             
             # 反向传播
             loss = loss / gradient_accumulation_steps  # 梯度累积
@@ -351,7 +355,7 @@ def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_
     
     total_metrics = {f'hits@{k}': 0.0 for k in k_list}
     total_metrics.update({f'map@{k}': 0.0 for k in k_list})
-    n_batches = 0
+    total_samples = 0
     
     with torch.no_grad():
         for batch in tqdm(data_loader.get_test_batches(), desc="Testing"):
@@ -359,7 +363,7 @@ def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_
             src = batch['src'].to(device)
             tgt = batch['tgt'].to(device)
             src_lengths = batch['src_lengths'].to(device)
-            time_intervals = batch['time_intervals'].to(device)
+            time_intervals = batch['time_intervals'].to(device) if 'time_intervals' in batch else None
             
             # 生成预测序列
             generated_seq, generated_probs = model.generate(
@@ -367,37 +371,49 @@ def test(model, data_loader, device, k_list=[10, 50, 100], input_ratio=0.5, max_
             )
             
             # 计算指标
-            for i in range(batch['src'].size(0)):
-                # 获取真实标签（跳过BOS和EOS）
-                gold_seq = tgt[i][tgt[i] != Constants.PAD]
-                gold_seq = gold_seq[1:-1]  # 去掉BOS和EOS
-                
-                if len(gold_seq) == 0:
-                    continue
-                
-                # 对每个位置计算指标
-                for j in range(min(len(gold_seq), max_output_len)):
-                    gold_user = gold_seq[j].item()
-                    pred_probs = generated_probs[i, j]
+            batch_size = tgt.size(0)
+            
+            # 对每个样本计算指标
+            for i in range(batch_size):
+                # 跳过BOS位置，只评估预测位置
+                for pos in range(1, min(4, tgt.size(1))):
+                    # 跳过PAD位置
+                    if tgt[i, pos] == Constants.PAD:
+                        continue
                     
-                    # 计算hits@k和map@k
-                    for k in k_list:
-                        hits = metrics.hits_k(pred_probs, gold_user, k=k)
-                        mapk = metrics.mapk(pred_probs, gold_user, k=k)
+                    total_samples += 1
+                    
+                    # 获取当前位置的真实标签
+                    gold_user = tgt[i, pos].item()
+                    
+                    # 获取当前位置的预测概率
+                    pred_pos = pos - 1  # 生成的序列不包含BOS
+                    if pred_pos < generated_probs.size(1):
+                        pred_probs = generated_probs[i, pred_pos]
                         
-                        total_metrics[f'hits@{k}'] += hits / len(gold_seq)
-                        total_metrics[f'map@{k}'] += mapk / len(gold_seq)
-            
-            n_batches += 1
-            
-            # 清除不需要的变量以节省内存
-            del src, tgt, src_lengths, time_intervals, generated_seq, generated_probs
-            torch.cuda.empty_cache()
+                        # 计算各种指标
+                        for k in k_list:
+                            # 获取top-k预测
+                            top_indices = torch.argsort(pred_probs, descending=True)[:k].cpu().numpy()
+                            
+                            # 计算hits@k
+                            hit = 1.0 if gold_user in top_indices else 0.0
+                            total_metrics[f'hits@{k}'] += hit
+                            
+                            # 计算MAP@k
+                            ap = 0.0
+                            if gold_user in top_indices:
+                                # 找到真实标签在top-k中的位置
+                                idx = np.where(top_indices == gold_user)[0][0]
+                                # 计算精度 = 1/(排名+1)
+                                ap = 1.0 / (idx + 1.0)
+                            total_metrics[f'map@{k}'] += ap
     
     # 计算平均指标
-    for k in k_list:
-        total_metrics[f'hits@{k}'] /= n_batches
-        total_metrics[f'map@{k}'] /= n_batches
+    if total_samples > 0:
+        for k in k_list:
+            total_metrics[f'hits@{k}'] /= total_samples
+            total_metrics[f'map@{k}'] /= total_samples
     
     return total_metrics
 
@@ -472,7 +488,7 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         pf_dim=args.pf_dim,
-        dropout=args.dropout,
+        dropout=0.3,  # 增加dropout
         use_network=args.use_network,
         adj=data_loader.adj_tensor if args.use_network and hasattr(data_loader, 'adj_tensor') else None,
         max_seq_length=args.max_seq_length
@@ -491,17 +507,21 @@ def main():
     
     # 定义损失函数和优化器
     crit = nn.CrossEntropyLoss(ignore_index=Constants.PAD, reduction='sum')
-
-    # 使用原始的 ScheduledOptim 类，而不是 CustomScheduledOptim
+    
+    # 使用权重衰减（L2正则化）
     optimizer = ScheduledOptim(
-        optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.98), eps=1e-9),  # 使用更大的学习率
+        optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.98), eps=1e-9, weight_decay=1e-5),
         args.hidden_dim,
-        args.warmup_steps // 2  # 缩短预热步数
+        args.warmup_steps // 2
     )
+    
+    # 早停策略
+    patience = 5
+    best_valid_map = 0.0
+    no_improvement_epochs = 0
     
     # 训练模型
     print("开始训练...")
-    best_valid_map = 0.0
     
     # 记录训练开始时间
     start_time = time.time()
@@ -552,10 +572,12 @@ def main():
                 f.write(f"Valid MAP@{k}: {valid_metrics[f'map@{k}']:.4f}\n")
             f.write("\n")
         
-        # 保存最佳模型（基于验证集MAP@10）
+        # 早停检查
         valid_map = valid_metrics['map@10']
         if valid_map > best_valid_map:
             best_valid_map = valid_map
+            no_improvement_epochs = 0
+            # 保存最佳模型
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
