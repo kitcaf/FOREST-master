@@ -10,13 +10,6 @@ import os
 
 from seq2seq_model import normalize, sparse_mx_to_torch_sparse_tensor
 
-"""
-改进的序列到序列数据加载器:
-    1. 处理级联数据和时间戳
-    2. 计算时间间隔
-    3. 分割序列为输入和目标
-    4. 加载社交网络数据
-"""
 class Seq2SeqDataLoader:
     """序列到序列数据加载器"""
     
@@ -241,6 +234,14 @@ class Seq2SeqDataLoader:
         """加载社交网络数据"""
         print("加载社交网络数据...")
         
+        # 检查网络数据文件是否存在
+        if not os.path.exists(self.net_data_path):
+            print(f"警告: 找不到社交网络数据文件 {self.net_data_path}")
+            self.adj_tensor = None
+            self.adj_dict = {}
+            self.embeds = None
+            return
+        
         # 创建邻接矩阵
         adj = sp.lil_matrix((self.user_size, self.user_size))
         self.adj_dict = {}
@@ -283,6 +284,12 @@ class Seq2SeqDataLoader:
             self.adj_tensor = self.adj_tensor.cuda()
         
         print(f"社交网络加载完成，共有 {len(self.adj_dict)} 个有连接的用户，{edge_count} 条边")
+        
+        # 检查预训练嵌入文件是否存在
+        if not os.path.exists(self.embed_file_path):
+            print(f"警告: 找不到预训练嵌入文件 {self.embed_file_path}")
+            self.embeds = None
+            return
         
         # 加载预训练嵌入
         try:
