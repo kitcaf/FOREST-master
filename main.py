@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument('-dropout', type=float, default=0.1, help='dropout率')
     
     # 训练参数
-    parser.add_argument('-n_epochs', type=int, default=30, help='训练轮数')
+    parser.add_argument('-n_epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('-learning_rate', type=float, default=0.001, help='学习率')
     parser.add_argument('-clip', type=float, default=1.0, help='梯度裁剪')
     parser.add_argument('-teacher_forcing_ratio', type=float, default=0.5, help='教师强制比例')
@@ -106,7 +106,7 @@ def train_epoch(model, data_loader, optimizer, criterion, clip, teacher_forcing_
     return total_loss / len(data_loader.get_train_batches())
 
 # 评估
-def evaluate(model, data_loader, criterion, split='valid', k_list=[1, 5, 10]):
+def evaluate(model, data_loader, criterion, split='valid', k_list=[10, 50, 100]):
     model.eval()
     total_loss = 0
     total_scores = {f'hits@{k}': 0.0 for k in k_list}
@@ -139,6 +139,7 @@ def evaluate(model, data_loader, criterion, split='valid', k_list=[1, 5, 10]):
             
             # 计算评估指标
             for t in range(min(tgt.size(1) - 1, 3)):  # 只考虑前3个预测
+                # 注意：outputs和tgt可能是CUDA张量，portfolio函数中会处理
                 scores, scores_len = portfolio(outputs[:, t, :], tgt[:, t+1], k_list=k_list)
                 for k in k_list:
                     total_scores[f'hits@{k}'] += scores[f'hits@{k}'] * scores_len
@@ -177,6 +178,12 @@ def predict(model, data_loader, split='test', top_k=3):
             
             # 预测
             pred = model.predict(src, src_lengths, time_intervals, max_length=3)
+            
+            # 将CUDA张量移到CPU
+            if pred.is_cuda:
+                pred = pred.cpu()
+            if tgt.is_cuda:
+                tgt = tgt.cpu()
             
             # 收集预测和真实值
             for i in range(pred.size(0)):
@@ -290,8 +297,8 @@ def main():
         # 打印结果
         print('-' * 89)
         print(f'| 轮次 {epoch:3d} | 训练损失 {train_loss:5.4f} | 验证损失 {valid_loss:5.4f} |')
-        print(f'| 验证指标 | hits@1: {valid_scores["hits@1"]:.4f} | hits@5: {valid_scores["hits@5"]:.4f} | hits@10: {valid_scores["hits@10"]:.4f} |')
-        print(f'| 验证指标 | map@1: {valid_scores["map@1"]:.4f} | map@5: {valid_scores["map@5"]:.4f} | map@10: {valid_scores["map@10"]:.4f} |')
+        print(f'| 验证指标 | hits@10: {valid_scores["hits@10"]:.4f} | hits@50: {valid_scores["hits@50"]:.4f} | hits@100: {valid_scores["hits@100"]:.4f} |')
+        print(f'| 验证指标 | map@10: {valid_scores["map@10"]:.4f} | map@50: {valid_scores["map@50"]:.4f} | map@100: {valid_scores["map@100"]:.4f} |')
         print('-' * 89)
         
         # 保存最佳模型
@@ -320,8 +327,8 @@ def main():
     # 打印测试结果
     print('=' * 89)
     print(f'| 测试损失 {test_loss:5.4f} |')
-    print(f'| 测试指标 | hits@1: {test_scores["hits@1"]:.4f} | hits@5: {test_scores["hits@5"]:.4f} | hits@10: {test_scores["hits@10"]:.4f} |')
-    print(f'| 测试指标 | map@1: {test_scores["map@1"]:.4f} | map@5: {test_scores["map@5"]:.4f} | map@10: {test_scores["map@10"]:.4f} |')
+    print(f'| 测试指标 | hits@10: {test_scores["hits@10"]:.4f} | hits@50: {test_scores["hits@50"]:.4f} | hits@100: {test_scores["hits@100"]:.4f} |')
+    print(f'| 测试指标 | map@10: {test_scores["map@10"]:.4f} | map@50: {test_scores["map@50"]:.4f} | map@100: {test_scores["map@100"]:.4f} |')
     print('=' * 89)
     
     # 生成预测结果

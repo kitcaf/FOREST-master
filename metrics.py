@@ -62,9 +62,16 @@ def hits_k(y_prob, y, k=10):
     """
     # 确保输入格式正确
     if isinstance(y_prob, torch.Tensor):
-        y_prob = y_prob.detach().cpu().numpy()
+        if y_prob.is_cuda:
+            y_prob = y_prob.detach().cpu().numpy()
+        else:
+            y_prob = y_prob.detach().numpy()
+    
     if isinstance(y, torch.Tensor):
-        y = y.detach().cpu().item()  # 转换为标量
+        if y.is_cuda:
+            y = y.detach().cpu().item()  # 转换为标量
+        else:
+            y = y.detach().item()
     
     # 确保k不超过预测张量的维度
     effective_k = min(k, len(y_prob))
@@ -91,9 +98,16 @@ def mapk(y_prob, y, k=10):
     """
     # 确保输入格式正确
     if isinstance(y_prob, torch.Tensor):
-        y_prob = y_prob.detach().cpu().numpy()
+        if y_prob.is_cuda:
+            y_prob = y_prob.detach().cpu().numpy()
+        else:
+            y_prob = y_prob.detach().numpy()
+    
     if isinstance(y, torch.Tensor):
-        y = y.detach().cpu().item()  # 转换为标量
+        if y.is_cuda:
+            y = y.detach().cpu().item()  # 转换为标量
+        else:
+            y = y.detach().item()
     
     # 确保k不超过预测张量的维度
     effective_k = min(k, len(y_prob))
@@ -125,18 +139,66 @@ def mean_rank(y_prob, y):
     return sum(ranks) / float(len(ranks))
 
 
-def portfolio(pred, gold, k_list=[1,5,10,20]):
+def portfolio(pred, gold, k_list=[10,50,100]):
+    """计算评估指标
+    
+    参数:
+        pred: 预测输出，可能是CUDA张量
+        gold: 真实标签，可能是CUDA张量
+        k_list: 评估的K值列表
+    
+    返回:
+        scores: 评估分数字典
+        scores_len: 有效样本数
+    """
     scores_len = 0
-    y_prob=[]
-    y=[]
-    for i in range(gold.shape[0]): # predict counts
-        if gold[i]!=Constants.PAD:
-            scores_len+=1.0
-            y_prob.append(pred[i])
-            y.append(gold[i])
+    y_prob = []
+    y = []
+    
+    # 确保处理的是CPU张量
+    if isinstance(pred, torch.Tensor) and pred.is_cuda:
+        pred_cpu = pred.detach().cpu()
+    else:
+        pred_cpu = pred
+    
+    if isinstance(gold, torch.Tensor) and gold.is_cuda:
+        gold_cpu = gold.detach().cpu()
+    else:
+        gold_cpu = gold
+    
+    for i in range(gold_cpu.shape[0]):  # predict counts
+        if gold_cpu[i] != Constants.PAD:
+            scores_len += 1.0
+            # 直接添加CPU张量到列表
+            y_prob.append(pred_cpu[i].numpy())
+            y.append(gold_cpu[i].item())
+    
     scores = {}
+    
+    # 如果没有有效样本，返回零分
+    if scores_len == 0:
+        for k in k_list:
+            scores['hits@' + str(k)] = 0.0
+            scores['map@' + str(k)] = 0.0
+        return scores, 0.0
+    
+    # 计算指标 - 不再需要在这里转换张量，因为y_prob和y已经是numpy数组和Python数值
     for k in k_list:
-        scores['hits@' + str(k)] = hits_k(y_prob, y, k=k)
-        scores['map@' + str(k)] = mapk(y_prob, y, k=k)
+        try:
+            hits = []
+            maps = []
+            for prob, truth in zip(y_prob, y):
+                hits.append(1.0 if truth in np.argsort(prob)[-k:][::-1] else 0.0)
+                
+                # 计算AP@k
+                top_indices = np.argsort(prob)[-k:][::-1].tolist()
+                maps.append(apk([truth], top_indices, k=k))
+            
+            scores['hits@' + str(k)] = sum(hits) / len(hits)
+            scores['map@' + str(k)] = sum(maps) / len(maps)
+        except Exception as e:
+            print(f"计算指标出错 (k={k}): {e}")
+            scores['hits@' + str(k)] = 0.0
+            scores['map@' + str(k)] = 0.0
 
     return scores, scores_len
