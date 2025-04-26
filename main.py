@@ -35,20 +35,22 @@ def parse_args():
     parser.add_argument('-embed_dim', type=int, default=64, help='嵌入维度')
     parser.add_argument('-hidden_size', type=int, default=128, help='隐藏层大小')
     parser.add_argument('-n_layers', type=int, default=2, help='GRU层数')
-    parser.add_argument('-dropout', type=float, default=0.1, help='dropout率')
+    parser.add_argument('-dropout', type=float, default=0.2, help='dropout率')
     
     # 训练参数
     parser.add_argument('-n_epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('-learning_rate', type=float, default=0.001, help='学习率')
+    parser.add_argument('-learning_rate', type=float, default=0.0005, help='学习率')
     parser.add_argument('-clip', type=float, default=1.0, help='梯度裁剪')
     parser.add_argument('-teacher_forcing_ratio', type=float, default=0.5, help='教师强制比例')
-    parser.add_argument('-n_warmup_steps', type=int, default=2000, help='预热步数')
+    parser.add_argument('-n_warmup_steps', type=int, default=4000, help='预热步数')
+    parser.add_argument('-weight_decay', type=float, default=1e-5, help='权重衰减（L2正则化）')
     
     # 其他参数
     parser.add_argument('-no_cuda', action='store_true', help='不使用CUDA')
     parser.add_argument('-seed', type=int, default=42, help='随机种子')
     parser.add_argument('-save_path', type=str, default='checkpoints/seq2seq_model.pt', help='模型保存路径')
     parser.add_argument('-log_interval', type=int, default=100, help='日志间隔')
+    parser.add_argument('-patience', type=int, default=10, help='早停耐心值')
     
     args = parser.parse_args()
     
@@ -73,11 +75,16 @@ def train_epoch(model, data_loader, optimizer, criterion, clip, teacher_forcing_
         # 前向传播
         outputs = model(src, src_lengths, time_intervals, tgt, teacher_forcing_ratio)
         
-        # 计算损失
+        # 计算损失 - 采用递减权重方案
         loss = 0
-        for t in range(tgt.size(1) - 1):  # -1 是因为最后一个token是EOS
-            loss += criterion(outputs[:, t, :], tgt[:, t+1])
-        loss = loss / (tgt.size(1) - 1)
+        position_weights = [1.2, 1.0, 0.8]  # 对前三个预测位置的权重，靠前的位置权重更大
+        
+        for t in range(min(tgt.size(1) - 1, 3)):  # 只关注前3个预测位置
+            pos_loss = criterion(outputs[:, t, :], tgt[:, t+1])
+            loss += position_weights[t] * pos_loss
+        
+        # 除以总权重而非位置数量
+        loss = loss / sum(position_weights[:min(tgt.size(1) - 1, 3)])
         
         # 反向传播
         optimizer.zero_grad()
@@ -129,11 +136,16 @@ def evaluate(model, data_loader, criterion, split='valid', k_list=[10, 50, 100])
             # 前向传播
             outputs = model(src, src_lengths, time_intervals, tgt, 0.0)  # 不使用教师强制
             
-            # 计算损失
+            # 计算损失 - 与训练时一致使用递减权重
             loss = 0
+            position_weights = [1.2, 1.0, 0.8]
+            
             for t in range(min(tgt.size(1) - 1, 3)):  # 只考虑前3个预测
-                loss += criterion(outputs[:, t, :], tgt[:, t+1])
-            loss = loss / min(tgt.size(1) - 1, 3)
+                pos_loss = criterion(outputs[:, t, :], tgt[:, t+1])
+                loss += position_weights[t] * pos_loss
+            
+            # 除以总权重
+            loss = loss / sum(position_weights[:min(tgt.size(1) - 1, 3)])
             
             total_loss += loss.item()
             
@@ -214,8 +226,14 @@ def main():
     # 设置随机种子
     set_seed(args.seed)
     
-    # 创建保存模型的目录
+    # 创建保存模型和结果的目录
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    result_dir = os.path.dirname(args.save_path)
+    
+    # 创建指标保存文件
+    metrics_file = os.path.join(result_dir, f'metrics_{args.data_name}.txt')
+    with open(metrics_file, 'w') as f:
+        f.write("epoch,train_loss,valid_loss,hits@10,hits@50,hits@100,map@10,map@50,map@100\n")
     
     # 加载数据
     data_loader = Seq2SeqDataLoader(
@@ -260,7 +278,7 @@ def main():
     
     # 定义优化器
     optimizer = ScheduledOptim(
-        optim.Adam(model.parameters(), lr=args.learning_rate),
+        optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay),
         args.embed_dim,
         args.n_warmup_steps
     )
@@ -270,7 +288,9 @@ def main():
     
     # 训练模型
     best_valid_loss = float('inf')
-    patience = 5
+    best_epoch = 0
+    best_metrics = {}
+    patience = args.patience
     patience_counter = 0
     
     for epoch in range(1, args.n_epochs + 1):
@@ -301,9 +321,17 @@ def main():
         print(f'| 验证指标 | map@10: {valid_scores["map@10"]:.4f} | map@50: {valid_scores["map@50"]:.4f} | map@100: {valid_scores["map@100"]:.4f} |')
         print('-' * 89)
         
+        # 保存每轮的评测指标
+        with open(metrics_file, 'a') as f:
+            f.write(f"{epoch},{train_loss:.6f},{valid_loss:.6f},"
+                    f"{valid_scores['hits@10']:.6f},{valid_scores['hits@50']:.6f},{valid_scores['hits@100']:.6f},"
+                    f"{valid_scores['map@10']:.6f},{valid_scores['map@50']:.6f},{valid_scores['map@100']:.6f}\n")
+        
         # 保存最佳模型
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
+            best_epoch = epoch
+            best_metrics = valid_scores.copy()
             torch.save(model.state_dict(), args.save_path)
             print(f"模型已保存到 {args.save_path}")
             patience_counter = 0
@@ -312,6 +340,13 @@ def main():
             if patience_counter >= patience:
                 print(f"早停: {patience} 轮验证损失未改善")
                 break
+    
+    # 打印最佳验证结果
+    print('=' * 89)
+    print(f'| 最佳验证轮次 {best_epoch:3d} | 验证损失 {best_valid_loss:5.4f} |')
+    print(f'| 验证指标 | hits@10: {best_metrics["hits@10"]:.4f} | hits@50: {best_metrics["hits@50"]:.4f} | hits@100: {best_metrics["hits@100"]:.4f} |')
+    print(f'| 验证指标 | map@10: {best_metrics["map@10"]:.4f} | map@50: {best_metrics["map@50"]:.4f} | map@100: {best_metrics["map@100"]:.4f} |')
+    print('=' * 89)
     
     # 加载最佳模型进行测试
     model.load_state_dict(torch.load(args.save_path))
@@ -331,17 +366,26 @@ def main():
     print(f'| 测试指标 | map@10: {test_scores["map@10"]:.4f} | map@50: {test_scores["map@50"]:.4f} | map@100: {test_scores["map@100"]:.4f} |')
     print('=' * 89)
     
-    # 生成预测结果
+    # 保存测试指标到文件
+    test_metrics_file = os.path.join(result_dir, f'test_metrics_{args.data_name}.txt')
+    with open(test_metrics_file, 'w') as f:
+        f.write("test_loss,hits@10,hits@50,hits@100,map@10,map@50,map@100\n")
+        f.write(f"{test_loss:.6f},"
+                f"{test_scores['hits@10']:.6f},{test_scores['hits@50']:.6f},{test_scores['hits@100']:.6f},"
+                f"{test_scores['map@10']:.6f},{test_scores['map@50']:.6f},{test_scores['map@100']:.6f}\n")
+    
+    print(f"测试指标已保存到 {test_metrics_file}")
+    
+    # 生成预测结果 (可选，不再是重点)
     predictions, ground_truth = predict(model, data_loader, split='test')
     
-    # 保存预测结果
+    # 保存预测结果 (可选，不再是重点)
     save_predictions(
         predictions,
         ground_truth,
         data_loader._idx2u,
-        file_path=f'results_{args.data_name}.txt'
+        file_path=os.path.join(result_dir, f'predictions_{args.data_name}.txt')
     )
-    print(f"预测结果已保存到 results_{args.data_name}.txt")
 
 if __name__ == "__main__":
     main() 
