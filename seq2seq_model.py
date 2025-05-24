@@ -6,6 +6,10 @@ import scipy.sparse as sp
 import Constants
 import math
 
+from utils.graph_utils import normalize, sparse_mx_to_torch_sparse_tensor
+from utils.feature_extraction import DisenIDPFeatureExtractor, IntentAwareSelfGating
+from utils.attention_mechanisms import LongTermAttention, ShortTermAttention
+
 def normalize(mx):
     """行归一化稀疏矩阵"""
     rowsum = np.array(mx.sum(1))
@@ -49,90 +53,41 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-class IntentAwareSelfGating(nn.Module):
-    """意图感知自门控机制，从DisenIDP中参考"""
-    
-    def __init__(self, input_dim, intent_type):
-        super(IntentAwareSelfGating, self).__init__()
-        self.intent_type = intent_type  # I (兴趣) 或 D (依赖)
-        self.W = nn.Linear(input_dim, input_dim)
-        self.sigmoid = nn.Sigmoid()
-        
-    def forward(self, X):
-        """
-        参数:
-            X: [batch_size, seq_len, input_dim] 或 [user_size, input_dim]
-        """
-        gate = self.sigmoid(self.W(X))
-        return X * gate
-
 class UserEmbeddingEnhancement(nn.Module):
-    """用户嵌入增强模块，结合DisenIDP和MS-HGAT的思想"""
+    """用户嵌入增强模块，整合DisenIDP特征提取方法"""
     
-    def __init__(self, user_size, embed_dim, adj_tensor=None, pretrained_embeds=None):
+    def __init__(self, user_size, embed_dim, adj_tensor=None, pretrained_embeds=None, dropout=0.2):
         super(UserEmbeddingEnhancement, self).__init__()
         
         self.user_size = user_size
         self.embed_dim = embed_dim
-        self.adj_tensor = adj_tensor  # 社交网络邻接矩阵
         
-        # 用户嵌入层
-        if pretrained_embeds is not None:
-            self.user_embeds = nn.Embedding.from_pretrained(
-                torch.FloatTensor(pretrained_embeds),
-                padding_idx=Constants.PAD,
-                freeze=False
-            )
-        else:
-            self.user_embeds = nn.Embedding(
-                user_size, 
-                embed_dim,
-                padding_idx=Constants.PAD
-            )
+        # 使用DisenIDP的特征提取器
+        self.feature_extractor = DisenIDPFeatureExtractor(
+            user_size=user_size,
+            embed_dim=embed_dim,
+            adj_tensor=adj_tensor,
+            pretrained_embeds=pretrained_embeds,
+            dropout=dropout
+        )
         
-        # DisenIDP的意图感知门控
-        self.interest_gate = IntentAwareSelfGating(embed_dim, "I")
-        self.dependency_gate = IntentAwareSelfGating(embed_dim, "D")
-        
-        # GCN层处理社交网络数据，来自MS-HGAT
-        self.gcn_layer = nn.Linear(embed_dim, embed_dim)
-        self.gcn_act = nn.ReLU()
-        
-        # 融合不同类型的表示
-        self.fusion_layer = nn.Linear(embed_dim * 3, embed_dim)
+        # 融合层
+        self.fusion_layer = nn.Linear(embed_dim, embed_dim)
         
     def forward(self, user_indices=None):
         """
         参数:
-            user_indices: 用户索引。如果为None，则计算所有用户
+            user_indices: 用户索引。如果为None，则返回所有用户的嵌入
         """
         if user_indices is None:
-            # 为所有用户生成嵌入
-            base_embeds = self.user_embeds.weight
+            # 获取所有用户的嵌入
+            return self.feature_extractor.user_embedding.weight
         else:
-            # 为特定用户生成嵌入
-            base_embeds = self.user_embeds(user_indices)
-        
-        # 生成不同意图的用户表示
-        interest_embeds = self.interest_gate(base_embeds)
-        dependency_embeds = self.dependency_gate(base_embeds)
-        
-        # 如果有社交网络数据，使用GCN增强
-        if self.adj_tensor is not None and user_indices is None:
-            # 对所有用户执行GCN
-            social_embeds = self.gcn_act(torch.spmm(self.adj_tensor, self.gcn_layer(base_embeds)))
-            # 融合不同的表示
-            combined_embeds = torch.cat([base_embeds, interest_embeds, dependency_embeds], dim=-1)
-        else:
-            # 没有社交网络数据或只处理特定用户，只融合意图表示
-            combined_embeds = torch.cat([base_embeds, interest_embeds, dependency_embeds], dim=-1)
-        
-        enhanced_embeds = self.fusion_layer(combined_embeds)
-        
-        return enhanced_embeds
+            # 获取特定用户的嵌入
+            return self.feature_extractor.user_embedding(user_indices)
 
 class EncoderRNN(nn.Module):
-    """编码器RNN"""
+    """编码器RNN，整合DisenIDP特征提取方法"""
     
     def __init__(self, user_embed, hidden_size, n_layers=1, dropout=0.1):
         super(EncoderRNN, self).__init__()
@@ -142,6 +97,9 @@ class EncoderRNN(nn.Module):
         self.embed_dim = user_embed.embed_dim
         
         self.user_embed = user_embed
+        self.feature_extractor = user_embed.feature_extractor
+        
+        # GRU层处理序列
         self.gru = nn.GRU(
             self.embed_dim + 1,  # +1 用于时间间隔特征
             hidden_size,
@@ -177,61 +135,8 @@ class EncoderRNN(nn.Module):
         
         return outputs, hidden
 
-class LongShortTermAttention(nn.Module):
-    """长短期注意力，从DisenIDP借鉴"""
-    
-    def __init__(self, hidden_size):
-        super(LongShortTermAttention, self).__init__()
-        
-        # 长期影响注意力参数
-        self.long_query = nn.Linear(hidden_size, hidden_size)
-        self.long_key = nn.Linear(hidden_size, hidden_size)
-        self.long_value = nn.Linear(hidden_size, hidden_size)
-        
-        # 短期影响注意力参数
-        self.short_query = nn.Linear(hidden_size, hidden_size)
-        self.short_key = nn.Linear(hidden_size, hidden_size)
-        self.short_value = nn.Linear(hidden_size, hidden_size)
-        
-        # 融合层
-        self.fusion = nn.Linear(hidden_size * 2, hidden_size)
-        
-    def forward(self, encoder_outputs, hidden):
-        """
-        参数:
-            encoder_outputs: [batch_size, seq_len, hidden_size]
-            hidden: [n_layers, batch_size, hidden_size]
-        """
-        # 使用最后一层隐藏状态
-        last_hidden = hidden[-1]  # [batch_size, hidden_size]
-        
-        # 计算长期注意力 (使用第一个节点作为查询)
-        first_node = encoder_outputs[:, 0, :]  # [batch_size, hidden_size]
-        long_query = self.long_query(first_node).unsqueeze(1)  # [batch_size, 1, hidden_size]
-        long_key = self.long_key(encoder_outputs)  # [batch_size, seq_len, hidden_size]
-        long_value = self.long_value(encoder_outputs)  # [batch_size, seq_len, hidden_size]
-        
-        long_scores = torch.bmm(long_query, long_key.transpose(1, 2)) / math.sqrt(encoder_outputs.size(-1))
-        long_attn = F.softmax(long_scores, dim=-1)  # [batch_size, 1, seq_len]
-        long_context = torch.bmm(long_attn, long_value).squeeze(1)  # [batch_size, hidden_size]
-        
-        # 计算短期注意力 (使用最后隐藏状态作为查询)
-        short_query = self.short_query(last_hidden).unsqueeze(1)  # [batch_size, 1, hidden_size]
-        short_key = self.short_key(encoder_outputs)  # [batch_size, seq_len, hidden_size]
-        short_value = self.short_value(encoder_outputs)  # [batch_size, seq_len, hidden_size]
-        
-        short_scores = torch.bmm(short_query, short_key.transpose(1, 2)) / math.sqrt(encoder_outputs.size(-1))
-        short_attn = F.softmax(short_scores, dim=-1)  # [batch_size, 1, seq_len]
-        short_context = torch.bmm(short_attn, short_value).squeeze(1)  # [batch_size, hidden_size]
-        
-        # 融合长短期上下文
-        context = torch.cat([long_context, short_context], dim=-1)  # [batch_size, hidden_size*2]
-        context = self.fusion(context)  # [batch_size, hidden_size]
-        
-        return context, long_attn.squeeze(1), short_attn.squeeze(1)
-
 class DecoderRNN(nn.Module):
-    """解码器RNN"""
+    """解码器RNN，整合DisenIDP的长短期注意力机制"""
     
     def __init__(self, user_embed, hidden_size, output_size, n_layers=1, dropout=0.1):
         super(DecoderRNN, self).__init__()
@@ -243,7 +148,10 @@ class DecoderRNN(nn.Module):
         
         self.user_embed = user_embed
         self.dropout = nn.Dropout(dropout)
-        self.attention = LongShortTermAttention(hidden_size)
+        
+        # 使用DisenIDP的长短期注意力
+        self.long_term_attention = LongTermAttention(hidden_size, attn_dropout=dropout)
+        self.short_term_attention = ShortTermAttention(hidden_size, attn_dropout=dropout)
         
         self.gru = nn.GRU(
             self.embed_dim + hidden_size,  # 嵌入 + 上下文向量
@@ -267,8 +175,23 @@ class DecoderRNN(nn.Module):
         embedded = self.user_embed(input_step)  # [batch_size, embed_dim]
         embedded = self.dropout(embedded)
         
-        # 计算注意力上下文
-        context, _, _ = self.attention(encoder_outputs, last_hidden)
+        # 计算长期注意力（使用第一个编码器输出）
+        first_encoder_output = encoder_outputs[:, 0, :]  # [batch_size, hidden_size]
+        long_term_context = self.long_term_attention(first_encoder_output, encoder_outputs, encoder_outputs)
+        
+        # 计算短期注意力（使用最后一个隐藏状态）
+        last_hidden_state = last_hidden[-1]  # [batch_size, hidden_size]
+        short_term_context = self.short_term_attention(last_hidden_state, encoder_outputs, encoder_outputs)
+        
+        # 修复: 确保长短期上下文形状匹配
+        # LongTermAttention 返回 [batch_size, seq_len, hidden_size]
+        # ShortTermAttention 返回 [batch_size, hidden_size]
+        # 我们需要取长期上下文的最后一个时间步
+        if long_term_context.dim() > short_term_context.dim():
+            long_term_context = long_term_context[:, -1, :]
+        
+        # 融合长短期上下文
+        context = (long_term_context + short_term_context) / 2  # 简单平均融合
         
         # 合并嵌入和上下文
         rnn_input = torch.cat([embedded, context], dim=1)  # [batch_size, embed_dim+hidden_size]
@@ -285,17 +208,18 @@ class DecoderRNN(nn.Module):
         return output, hidden
 
 class Seq2SeqModel(nn.Module):
-    """序列到序列模型"""
+    """序列到序列模型，整合DisenIDP特征提取方法"""
     
     def __init__(self, user_size, embed_dim, hidden_size, n_layers=2, dropout=0.1, adj_tensor=None, pretrained_embeds=None):
         super(Seq2SeqModel, self).__init__()
         
-        # 用户嵌入增强
+        # 用户嵌入增强，整合DisenIDP特征
         self.user_embed = UserEmbeddingEnhancement(
             user_size, 
             embed_dim, 
             adj_tensor, 
-            pretrained_embeds
+            pretrained_embeds,
+            dropout
         )
         
         # 编码器

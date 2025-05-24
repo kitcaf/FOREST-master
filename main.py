@@ -37,6 +37,10 @@ def parse_args():
     parser.add_argument('-n_layers', type=int, default=2, help='GRU层数')
     parser.add_argument('-dropout', type=float, default=0.2, help='dropout率')
     
+    # DisenIDP特征提取参数
+    parser.add_argument('-use_hypergraph', type=bool, default=True, help='是否使用超图特征')
+    parser.add_argument('-window_size', type=int, default=5, help='超图滑动窗口大小')
+    
     # 训练参数
     parser.add_argument('-n_epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('-learning_rate', type=float, default=0.0005, help='学习率')
@@ -249,6 +253,7 @@ def main():
     # 创建模型
     has_social_data = hasattr(data_loader, 'adj_tensor') and data_loader.adj_tensor is not None
     has_pretrained_embeds = hasattr(data_loader, 'embeds') and data_loader.embeds is not None
+    has_hypergraph = hasattr(data_loader, 'HG_Item') and data_loader.HG_Item is not None and args.use_hypergraph
     
     if has_social_data:
         print("使用社交网络关系数据进行模型训练")
@@ -260,13 +265,21 @@ def main():
     else:
         print("警告: 无预训练用户嵌入，将随机初始化用户嵌入")
     
+    if has_hypergraph:
+        print("使用DisenIDP风格的超图特征")
+        # 如果使用超图，将其作为adj_tensor传递给模型
+        adj_tensor = data_loader.HG_Item if args.use_hypergraph else data_loader.adj_tensor
+    else:
+        print("警告: 无超图特征，将使用普通社交网络特征")
+        adj_tensor = data_loader.adj_tensor
+    
     model = Seq2SeqModel(
         user_size=data_loader.user_size,
         embed_dim=args.embed_dim,
         hidden_size=args.hidden_size,
         n_layers=args.n_layers,
         dropout=args.dropout,
-        adj_tensor=data_loader.adj_tensor if has_social_data else None,
+        adj_tensor=adj_tensor,
         pretrained_embeds=data_loader.embeds if has_pretrained_embeds else None
     )
     

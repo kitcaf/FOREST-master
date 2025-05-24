@@ -8,7 +8,7 @@ import scipy.sparse as sp
 import gc
 import os
 
-from seq2seq_model import normalize, sparse_mx_to_torch_sparse_tensor
+from utils.graph_utils import normalize, sparse_mx_to_torch_sparse_tensor, construct_hypergraph
 
 class Seq2SeqDataLoader:
     """序列到序列数据加载器"""
@@ -231,7 +231,7 @@ class Seq2SeqDataLoader:
         return intervals
     
     def _load_network_data(self):
-        """加载社交网络数据"""
+        """加载社交网络数据，并构建DisenIDP风格的超图"""
         print("加载社交网络数据...")
         
         # 检查网络数据文件是否存在
@@ -284,6 +284,21 @@ class Seq2SeqDataLoader:
             self.adj_tensor = self.adj_tensor.cuda()
         
         print(f"社交网络加载完成，共有 {len(self.adj_dict)} 个有连接的用户，{edge_count} 条边")
+        
+        # 构建DisenIDP风格的超图
+        print("构建DisenIDP风格的超图...")
+        # 合并所有级联数据用于构建超图
+        all_cascades = self.train_cascades + self.valid_cascades + self.test_cascades
+        
+        # 使用DisenIDP的超图构建方法
+        window_size = 5  # 滑动窗口大小
+        self.HG_Item, self.HG_User = construct_hypergraph(all_cascades, self.user_size, window_size)
+        
+        if self.cuda:
+            self.HG_Item = self.HG_Item.cuda()
+            self.HG_User = self.HG_User.cuda()
+        
+        print("超图构建完成")
         
         # 检查预训练嵌入文件是否存在
         if not os.path.exists(self.embed_file_path):
