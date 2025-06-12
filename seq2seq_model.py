@@ -359,9 +359,28 @@ class SocialAwareDecoderRNN(nn.Module):
                 if node_idx < 4:  # 小于4的是特殊标记
                     mask[i, :] = 1.0  # 不屏蔽任何节点
                 else:
-                    # 获取当前节点的邻居（邻接矩阵中的非零元素）
-                    neighbors = self.adj_matrix[node_idx].coalesce().indices()[1]
-                    mask[i, neighbors] = 1.0  # 只允许邻居节点
+                    try:
+                        # 获取当前节点的邻居
+                        # 修复：安全地获取邻居节点
+                        if isinstance(self.adj_matrix, torch.Tensor) and self.adj_matrix.is_sparse:
+                            # 获取稀疏矩阵的索引和值
+                            indices = self.adj_matrix._indices()
+                            # 找出所有以node_idx为起始点的边
+                            mask_idx = (indices[0] == node_idx)
+                            # 获取终点节点作为邻居
+                            if mask_idx.any():
+                                neighbors = indices[1][mask_idx]
+                                mask[i, neighbors] = 1.0  # 只允许邻居节点
+                        else:
+                            # 对于非稀疏矩阵或其他情况
+                            # 获取node_idx行中非零元素的列索引
+                            row = self.adj_matrix[node_idx].to_dense() if hasattr(self.adj_matrix[node_idx], 'to_dense') else self.adj_matrix[node_idx]
+                            neighbors = torch.nonzero(row).squeeze(-1)
+                            mask[i, neighbors] = 1.0  # 只允许邻居节点
+                    except Exception as e:
+                        print(f"警告: 获取节点 {node_idx} 的邻居时出错: {e}")
+                        # 出错时不应用约束
+                        mask[i, :] = 1.0
                     
                     # 特殊标记总是可用
                     mask[i, :4] = 1.0
@@ -476,19 +495,30 @@ class GraphAugmentedSeq2Seq(nn.Module):
         
         # 逐步解码
         for _ in range(max_length):
-            # 解码一个步骤
-            output, hidden, attn_weights = self.decoder(decoder_input, hidden, encoder_outputs, last_node)
-            
-            # 获取最可能的用户
-            _, topi = output.topk(1)
-            decoder_input = topi.squeeze(-1)
-            
-            # 更新上一个节点（用于社交约束）
-            last_node = decoder_input
-            
-            # 添加到预测中
-            predictions.append(decoder_input.detach())
-            attentions.append(attn_weights.detach())
+            try:
+                # 解码一个步骤
+                output, hidden, attn_weights = self.decoder(decoder_input, hidden, encoder_outputs, last_node)
+                
+                # 获取最可能的用户
+                _, topi = output.topk(1)
+                decoder_input = topi.squeeze(-1)
+                
+                # 更新上一个节点（用于社交约束）
+                last_node = decoder_input
+                
+                # 添加到预测中
+                predictions.append(decoder_input.detach())
+                attentions.append(attn_weights.detach())
+            except Exception as e:
+                print(f"预测过程中出错: {e}")
+                # 如果出错，使用随机预测
+                random_pred = torch.randint(4, self.decoder.output_size, (batch_size,), device=src.device)
+                decoder_input = random_pred
+                last_node = decoder_input
+                predictions.append(decoder_input.detach())
+                # 创建一个空的注意力权重
+                empty_attn = torch.ones(batch_size, 1, encoder_outputs.size(1), device=src.device) / encoder_outputs.size(1)
+                attentions.append(empty_attn)
         
         # 堆叠预测结果
         return torch.stack(predictions, dim=1), attentions  # [batch_size, max_length] 

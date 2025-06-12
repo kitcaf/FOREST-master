@@ -48,6 +48,7 @@ def parse_args():
     # 图神经网络参数
     parser.add_argument('-use_hypergraph', type=bool, default=True, help='是否使用超图特征')
     parser.add_argument('-use_social_constraint', type=bool, default=True, help='是否使用社交约束')
+    parser.add_argument('-disable_all_constraints', action='store_true', help='禁用所有社交约束和图特征，纯序列模型')
     parser.add_argument('-window_size', type=int, default=5, help='超图滑动窗口大小')
     
     # 训练参数
@@ -70,6 +71,12 @@ def parse_args():
     # 设置CUDA
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     
+    # 如果选择禁用所有约束，则设置相关参数
+    if args.disable_all_constraints:
+        args.use_hypergraph = False
+        args.use_social_constraint = False
+        print("警告: 已禁用所有社交网络约束和图特征，将使用纯序列模型")
+    
     return args
 
 # 训练一个epoch
@@ -80,7 +87,15 @@ def train_epoch(model, data_loader, optimizer, criterion, clip, teacher_forcing_
     start_time = time.time()
     n_batches = 0
     
+    # 计算总批次数
+    total_batches = len(data_loader.get_train_batches())
+    print(f"\n开始训练第 {epoch} 轮 | 共 {total_batches} 批次")
+    print("="*50)
+    
     for batch_idx, batch in enumerate(data_loader.get_train_batches()):
+        # 计算进度百分比
+        progress = (batch_idx + 1) / total_batches * 100
+        
         # 获取数据
         src = batch['src']
         tgt = batch['tgt']
@@ -118,17 +133,33 @@ def train_epoch(model, data_loader, optimizer, criterion, clip, teacher_forcing_
         n_batches += 1
         
         # 打印日志
-        if batch_idx % log_interval == 0 and batch_idx > 0:
+        if batch_idx % log_interval == 0:
             elapsed = time.time() - start_time
-            print('| 轮次 {:3d} | {:5d}/{:5d} 批次 | ms/批次 {:5.2f} | '
-                  '损失 {:5.4f} | 学习率 {:9.7f} |'.format(
-                      epoch, batch_idx, len(data_loader.get_train_batches()),
-                      elapsed * 1000 / log_interval,
-                      total_loss / log_interval,
-                      lr))
-            total_loss = 0
-            start_time = time.time()
+            avg_loss = total_loss / max(1, batch_idx % log_interval + 1)
+            
+            # 计算预计剩余时间
+            if batch_idx > 0:
+                time_per_batch = elapsed / (batch_idx % log_interval + 1)
+                remaining_batches = total_batches - (batch_idx + 1)
+                eta_seconds = remaining_batches * time_per_batch
+                eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
+            else:
+                eta_str = "计算中..."
+            
+            # 进度条
+            bar_length = 30
+            filled_length = int(bar_length * (batch_idx + 1) // total_batches)
+            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+            
+            print(f"\r[{bar}] {progress:.1f}% | 批次: {batch_idx+1}/{total_batches} | "
+                  f"损失: {avg_loss:.4f} | 学习率: {lr:.6f} | 预计剩余: {eta_str}", end='')
+            
+            if (batch_idx % log_interval == 0 and batch_idx > 0) or batch_idx == total_batches - 1:
+                print()  # 换行
+                total_loss = 0
+                start_time = time.time()
     
+    print(f"\n第 {epoch} 轮训练完成")
     return total_loss / n_batches if n_batches > 0 else float('inf')
 
 # 评估
@@ -273,7 +304,7 @@ def main():
         batch_size=args.batch_size,
         cuda=args.cuda,
         shuffle=True,
-        loadNE=True,
+        loadNE=not args.disable_all_constraints,  # 如果禁用约束，不加载网络嵌入
         max_seq_length=args.max_seq_length
     )
     
@@ -287,23 +318,26 @@ def main():
     has_pretrained_embeds = hasattr(data_loader, 'embeds') and data_loader.embeds is not None
     has_hypergraph = hasattr(data_loader, 'HG_User') and data_loader.HG_User is not None and args.use_hypergraph
     
-    if has_social_data:
-        print("使用社交网络关系数据进行模型训练")
+    # 邻接矩阵或超图
+    adj_tensor = None
+    if not args.disable_all_constraints:
+        if has_social_data:
+            print("使用社交网络关系数据进行模型训练")
+            if has_hypergraph and args.use_hypergraph:
+                print("使用超图特征增强社交网络建模")
+                adj_tensor = data_loader.HG_User
+            else:
+                print("使用普通社交网络特征")
+                adj_tensor = data_loader.adj_tensor
+        else:
+            print("警告: 无社交网络关系数据，模型将只使用扩散序列信息")
+            
+        if has_pretrained_embeds:
+            print("使用预训练的用户嵌入")
+        else:
+            print("警告: 无预训练用户嵌入，将随机初始化用户嵌入")
     else:
-        print("警告: 无社交网络关系数据，模型将只使用扩散序列信息")
-        
-    if has_pretrained_embeds:
-        print("使用预训练的用户嵌入")
-    else:
-        print("警告: 无预训练用户嵌入，将随机初始化用户嵌入")
-    
-    if has_hypergraph:
-        print("使用超图特征增强社交网络建模")
-        # 如果使用超图，将其作为adj_tensor传递给模型
-        adj_tensor = data_loader.HG_User if args.use_hypergraph else data_loader.adj_tensor
-    else:
-        print("警告: 无超图特征，将使用普通社交网络特征")
-        adj_tensor = data_loader.adj_tensor
+        print("已禁用所有社交网络特征，使用纯序列模型")
     
     print(f"创建Graph-Augmented Seq2Seq模型...")
     model = GraphAugmentedSeq2Seq(
@@ -312,8 +346,8 @@ def main():
         hidden_size=args.hidden_size,
         n_layers=args.n_layers,
         dropout=args.dropout,
-        adj_tensor=adj_tensor if args.use_social_constraint else None,  # 条件判断是否使用社交约束
-        pretrained_embeds=data_loader.embeds if has_pretrained_embeds else None,
+        adj_tensor=adj_tensor if args.use_social_constraint and not args.disable_all_constraints else None,
+        pretrained_embeds=data_loader.embeds if has_pretrained_embeds and not args.disable_all_constraints else None,
         bidirectional_encoder=args.bidirectional
     )
     
