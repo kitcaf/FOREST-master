@@ -1,11 +1,22 @@
-'''A wrapper class for optimizer '''
+"""
+优化器包装类，提供学习率调度功能
+"""
+
 import numpy as np
 import math
 
 class ScheduledOptim(object):
-    '''A simple wrapper class for learning rate scheduling'''
+    """学习率调度优化器包装类"""
 
     def __init__(self, optimizer, d_model, n_warmup_steps):
+        """
+        初始化
+        
+        参数:
+            optimizer: 基础优化器
+            d_model: 模型维度，用于计算学习率缩放
+            n_warmup_steps: 预热步数
+        """
         self.optimizer = optimizer
         self.d_model = d_model
         self.n_warmup_steps = n_warmup_steps
@@ -14,20 +25,22 @@ class ScheduledOptim(object):
         # 保存初始学习率
         self.initial_lr = optimizer.param_groups[0]['lr']
         
+        # 学习率历史，用于监控
+        self.lr_history = []
+        
         # 添加最小学习率限制
         self.min_lr = self.initial_lr * 0.01  # 最小学习率为初始学习率的1%
 
     def step(self):
-        "Step by the inner optimizer"
+        """执行优化器步骤"""
         self.optimizer.step()
 
     def zero_grad(self):
-        "Zero out the gradients by the inner optimizer"
+        """清零梯度"""
         self.optimizer.zero_grad()
 
     def update_learning_rate(self):
-        ''' Learning rate scheduling per step '''
-
+        """更新学习率，根据当前步数动态调整"""
         self.n_current_steps += 1
         
         # 预热阶段
@@ -46,6 +59,7 @@ class ScheduledOptim(object):
         new_lr = self.initial_lr * lr_scale
 
         # 保存学习率历史以便绘图
+        self.lr_history.append(new_lr)
         self.last_lr = new_lr
         
         # 更新所有参数组的学习率
@@ -53,3 +67,11 @@ class ScheduledOptim(object):
             param_group['lr'] = new_lr
             
         return new_lr
+    
+    def get_lr_history(self):
+        """获取学习率历史"""
+        return self.lr_history
+    
+    def get_last_lr(self):
+        """获取最近的学习率"""
+        return self.last_lr if hasattr(self, 'last_lr') else self.initial_lr

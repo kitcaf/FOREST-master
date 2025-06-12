@@ -1,3 +1,8 @@
+"""
+Graph-Augmented Seq2Seq模型训练和评估主程序
+用于社交网络信息扩散预测任务
+"""
+
 import os
 import time
 import argparse
@@ -8,13 +13,14 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 
 from seq2seq_dataloader import Seq2SeqDataLoader
-from seq2seq_model import Seq2SeqModel
+from seq2seq_model import GraphAugmentedSeq2Seq
 from Optim import ScheduledOptim
 from metrics import portfolio
 import Constants
 
 # 设置随机种子
 def set_seed(seed):
+    """设置随机种子，确保实验可复现"""
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -23,7 +29,8 @@ def set_seed(seed):
 
 # 定义参数
 def parse_args():
-    parser = argparse.ArgumentParser()
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="图增强序列到序列模型用于社交网络信息扩散预测")
     
     # 数据参数
     parser.add_argument('-data_name', type=str, default='twitter', help='数据集名称')
@@ -32,13 +39,15 @@ def parse_args():
     parser.add_argument('-max_seq_length', type=int, default=100, help='最大序列长度')
     
     # 模型参数
-    parser.add_argument('-embed_dim', type=int, default=64, help='嵌入维度')
-    parser.add_argument('-hidden_size', type=int, default=128, help='隐藏层大小')
+    parser.add_argument('-embed_dim', type=int, default=128, help='嵌入维度')
+    parser.add_argument('-hidden_size', type=int, default=256, help='隐藏层大小')
     parser.add_argument('-n_layers', type=int, default=2, help='GRU层数')
     parser.add_argument('-dropout', type=float, default=0.2, help='dropout率')
+    parser.add_argument('-bidirectional', type=bool, default=True, help='是否使用双向编码器')
     
-    # DisenIDP特征提取参数
+    # 图神经网络参数
     parser.add_argument('-use_hypergraph', type=bool, default=True, help='是否使用超图特征')
+    parser.add_argument('-use_social_constraint', type=bool, default=True, help='是否使用社交约束')
     parser.add_argument('-window_size', type=int, default=5, help='超图滑动窗口大小')
     
     # 训练参数
@@ -52,8 +61,8 @@ def parse_args():
     # 其他参数
     parser.add_argument('-no_cuda', action='store_true', help='不使用CUDA')
     parser.add_argument('-seed', type=int, default=42, help='随机种子')
-    parser.add_argument('-save_path', type=str, default='checkpoints/seq2seq_model.pt', help='模型保存路径')
-    parser.add_argument('-log_interval', type=int, default=100, help='日志间隔')
+    parser.add_argument('-save_path', type=str, default='checkpoints/graph_seq2seq_model.pt', help='模型保存路径')
+    parser.add_argument('-log_interval', type=int, default=10, help='日志间隔')
     parser.add_argument('-patience', type=int, default=10, help='早停耐心值')
     
     args = parser.parse_args()
@@ -65,9 +74,11 @@ def parse_args():
 
 # 训练一个epoch
 def train_epoch(model, data_loader, optimizer, criterion, clip, teacher_forcing_ratio, log_interval, epoch):
+    """训练一个epoch"""
     model.train()
     total_loss = 0
     start_time = time.time()
+    n_batches = 0
     
     for batch_idx, batch in enumerate(data_loader.get_train_batches()):
         # 获取数据
@@ -99,30 +110,36 @@ def train_epoch(model, data_loader, optimizer, criterion, clip, teacher_forcing_
         
         # 参数更新
         optimizer.step()
-        optimizer.update_learning_rate()
+        
+        # 更新学习率
+        lr = optimizer.update_learning_rate()
         
         total_loss += loss.item()
+        n_batches += 1
         
         # 打印日志
         if batch_idx % log_interval == 0 and batch_idx > 0:
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | '
-                  'loss {:5.4f}'.format(
+            print('| 轮次 {:3d} | {:5d}/{:5d} 批次 | ms/批次 {:5.2f} | '
+                  '损失 {:5.4f} | 学习率 {:9.7f} |'.format(
                       epoch, batch_idx, len(data_loader.get_train_batches()),
                       elapsed * 1000 / log_interval,
-                      total_loss / log_interval))
+                      total_loss / log_interval,
+                      lr))
             total_loss = 0
             start_time = time.time()
     
-    return total_loss / len(data_loader.get_train_batches())
+    return total_loss / n_batches if n_batches > 0 else float('inf')
 
 # 评估
 def evaluate(model, data_loader, criterion, split='valid', k_list=[10, 50, 100]):
+    """评估模型性能"""
     model.eval()
     total_loss = 0
     total_scores = {f'hits@{k}': 0.0 for k in k_list}
     total_scores.update({f'map@{k}': 0.0 for k in k_list})
     total_len = 0
+    n_batches = 0
     
     with torch.no_grad():
         if split == 'valid':
@@ -152,6 +169,7 @@ def evaluate(model, data_loader, criterion, split='valid', k_list=[10, 50, 100])
             loss = loss / sum(position_weights[:min(tgt.size(1) - 1, 3)])
             
             total_loss += loss.item()
+            n_batches += 1
             
             # 计算评估指标
             for t in range(min(tgt.size(1) - 1, 3)):  # 只考虑前3个预测
@@ -163,7 +181,7 @@ def evaluate(model, data_loader, criterion, split='valid', k_list=[10, 50, 100])
                 total_len += scores_len
     
     # 计算平均值
-    avg_loss = total_loss / len(data_batches)
+    avg_loss = total_loss / n_batches if n_batches > 0 else float('inf')
     
     # 计算平均指标
     if total_len > 0:
@@ -175,9 +193,11 @@ def evaluate(model, data_loader, criterion, split='valid', k_list=[10, 50, 100])
 
 # 预测
 def predict(model, data_loader, split='test', top_k=3):
+    """使用模型进行预测"""
     model.eval()
     predictions = []
     ground_truth = []
+    attention_weights = []
     
     with torch.no_grad():
         if split == 'valid':
@@ -193,7 +213,7 @@ def predict(model, data_loader, split='test', top_k=3):
             time_intervals = batch['time_intervals']
             
             # 预测
-            pred = model.predict(src, src_lengths, time_intervals, max_length=3)
+            pred, attn = model.predict(src, src_lengths, time_intervals, max_length=3)
             
             # 将CUDA张量移到CPU
             if pred.is_cuda:
@@ -208,11 +228,16 @@ def predict(model, data_loader, split='test', top_k=3):
                 
                 predictions.append(pred_seq)
                 ground_truth.append(true_seq)
+                
+                # 收集注意力权重（可选）
+                batch_attn = [a[i].cpu().numpy() for a in attn]
+                attention_weights.append(batch_attn)
     
-    return predictions, ground_truth
+    return predictions, ground_truth, attention_weights
 
 # 保存预测结果
 def save_predictions(predictions, ground_truth, idx2u, file_path):
+    """保存预测结果到文件"""
     with open(file_path, 'w', encoding='utf-8') as f:
         f.write("预测序列\t真实序列\n")
         for pred, true in zip(predictions, ground_truth):
@@ -224,6 +249,7 @@ def save_predictions(predictions, ground_truth, idx2u, file_path):
             f.write(f"{' -> '.join(pred_users)}\t{' -> '.join(true_users)}\n")
 
 def main():
+    """主函数"""
     # 解析参数
     args = parse_args()
     
@@ -240,6 +266,7 @@ def main():
         f.write("epoch,train_loss,valid_loss,hits@10,hits@50,hits@100,map@10,map@50,map@100\n")
     
     # 加载数据
+    print(f"正在加载 {args.data_name} 数据集...")
     data_loader = Seq2SeqDataLoader(
         data_name=args.data_name,
         split_ratio=args.split_ratio,
@@ -250,10 +277,15 @@ def main():
         max_seq_length=args.max_seq_length
     )
     
+    # 确认数据集大小
+    print(f"训练集大小: {len(data_loader.train_cascades)} 个级联序列")
+    print(f"验证集大小: {len(data_loader.valid_cascades)} 个级联序列")
+    print(f"测试集大小: {len(data_loader.test_cascades)} 个级联序列")
+    
     # 创建模型
     has_social_data = hasattr(data_loader, 'adj_tensor') and data_loader.adj_tensor is not None
     has_pretrained_embeds = hasattr(data_loader, 'embeds') and data_loader.embeds is not None
-    has_hypergraph = hasattr(data_loader, 'HG_Item') and data_loader.HG_Item is not None and args.use_hypergraph
+    has_hypergraph = hasattr(data_loader, 'HG_User') and data_loader.HG_User is not None and args.use_hypergraph
     
     if has_social_data:
         print("使用社交网络关系数据进行模型训练")
@@ -266,24 +298,27 @@ def main():
         print("警告: 无预训练用户嵌入，将随机初始化用户嵌入")
     
     if has_hypergraph:
-        print("使用DisenIDP风格的超图特征")
+        print("使用超图特征增强社交网络建模")
         # 如果使用超图，将其作为adj_tensor传递给模型
-        adj_tensor = data_loader.HG_Item if args.use_hypergraph else data_loader.adj_tensor
+        adj_tensor = data_loader.HG_User if args.use_hypergraph else data_loader.adj_tensor
     else:
         print("警告: 无超图特征，将使用普通社交网络特征")
         adj_tensor = data_loader.adj_tensor
     
-    model = Seq2SeqModel(
+    print(f"创建Graph-Augmented Seq2Seq模型...")
+    model = GraphAugmentedSeq2Seq(
         user_size=data_loader.user_size,
         embed_dim=args.embed_dim,
         hidden_size=args.hidden_size,
         n_layers=args.n_layers,
         dropout=args.dropout,
-        adj_tensor=adj_tensor,
-        pretrained_embeds=data_loader.embeds if has_pretrained_embeds else None
+        adj_tensor=adj_tensor if args.use_social_constraint else None,  # 条件判断是否使用社交约束
+        pretrained_embeds=data_loader.embeds if has_pretrained_embeds else None,
+        bidirectional_encoder=args.bidirectional
     )
     
     if args.cuda:
+        print("使用CUDA加速训练")
         model = model.cuda()
     
     # 定义损失函数
@@ -292,12 +327,15 @@ def main():
     # 定义优化器
     optimizer = ScheduledOptim(
         optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay),
-        args.embed_dim,
+        args.hidden_size,
         args.n_warmup_steps
     )
     
     # 打印模型信息
-    print(f"模型参数数量: {sum(p.numel() for p in model.parameters())}")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型总参数数量: {total_params:,}")
+    print(f"可训练参数数量: {trainable_params:,}")
     
     # 训练模型
     best_valid_loss = float('inf')
@@ -306,6 +344,7 @@ def main():
     patience = args.patience
     patience_counter = 0
     
+    print("开始训练...")
     for epoch in range(1, args.n_epochs + 1):
         # 训练
         train_loss = train_epoch(
@@ -362,6 +401,7 @@ def main():
     print('=' * 89)
     
     # 加载最佳模型进行测试
+    print("加载最佳模型进行测试...")
     model.load_state_dict(torch.load(args.save_path))
     
     # 测试
@@ -389,16 +429,21 @@ def main():
     
     print(f"测试指标已保存到 {test_metrics_file}")
     
-    # 生成预测结果 (可选，不再是重点)
-    predictions, ground_truth = predict(model, data_loader, split='test')
+    # 生成预测结果
+    print("生成测试集预测结果...")
+    predictions, ground_truth, attention_weights = predict(model, data_loader, split='test')
     
-    # 保存预测结果 (可选，不再是重点)
+    # 保存预测结果
+    predictions_file = os.path.join(result_dir, f'predictions_{args.data_name}.txt')
     save_predictions(
         predictions,
         ground_truth,
         data_loader._idx2u,
-        file_path=os.path.join(result_dir, f'predictions_{args.data_name}.txt')
+        file_path=predictions_file
     )
+    print(f"预测结果已保存到 {predictions_file}")
+    
+    print("模型训练和评估完成!")
 
 if __name__ == "__main__":
     main() 

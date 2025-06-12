@@ -10,6 +10,7 @@ import Constants
 import torch
 
 def _retype(y_prob, y):
+    """将输入转换为numpy数组"""
     if not isinstance(y, (collections.Sequence, np.ndarray)):
         y_prob = [y_prob]
         y = [y]
@@ -23,21 +24,15 @@ def _binarize(y, n_classes=None):
 
 def apk(actual, predicted, k=10):
     """
-    Computes the average precision at k.
-    This function computes the average prescision at k between two lists of
-    items.
-    Parameters
-    ----------
-    actual : list
-             A list of elements that are to be predicted (order doesn't matter)
-    predicted : list
-                A list of predicted elements (order does matter)
-    k : int, optional
-        The maximum number of predicted elements
-    Returns
-    -------
-    score : double
-            The average precision at k over the input lists
+    计算平均精度@k
+    
+    参数:
+        actual: 实际元素列表
+        predicted: 预测元素列表（顺序很重要）
+        k: 考虑的预测元素的最大数量
+        
+    返回:
+        score: 平均精度@k
     """
     if len(predicted) > k:
         predicted = predicted[:k]
@@ -58,7 +53,15 @@ def apk(actual, predicted, k=10):
 
 def hits_k(y_prob, y, k=10):
     """
-    计算单个样本的Hits@k，添加安全检查
+    计算单个样本的Hits@k
+    
+    参数:
+        y_prob: 预测概率
+        y: 真实标签
+        k: 考虑的预测元素的最大数量
+        
+    返回:
+        1.0 如果真实标签在前k个预测中，否则0.0
     """
     # 确保输入格式正确
     if isinstance(y_prob, torch.Tensor):
@@ -94,7 +97,15 @@ def hits_k(y_prob, y, k=10):
 
 def mapk(y_prob, y, k=10):
     """
-    计算单个样本的Average Precision@k，添加安全检查
+    计算单个样本的Average Precision@k
+    
+    参数:
+        y_prob: 预测概率
+        y: 真实标签
+        k: 考虑的预测元素的最大数量
+        
+    返回:
+        Average Precision@k
     """
     # 确保输入格式正确
     if isinstance(y_prob, torch.Tensor):
@@ -140,15 +151,16 @@ def mean_rank(y_prob, y):
 
 
 def portfolio(pred, gold, k_list=[10,50,100]):
-    """计算评估指标
+    """
+    计算多个评估指标
     
     参数:
-        pred: 预测输出，可能是CUDA张量
-        gold: 真实标签，可能是CUDA张量
+        pred: 预测输出，可能是CUDA张量 [batch_size, vocab_size]
+        gold: 真实标签，可能是CUDA张量 [batch_size]
         k_list: 评估的K值列表
     
     返回:
-        scores: 评估分数字典
+        scores: 评估分数字典，包含hits@k和map@k
         scores_len: 有效样本数
     """
     scores_len = 0
@@ -166,12 +178,15 @@ def portfolio(pred, gold, k_list=[10,50,100]):
     else:
         gold_cpu = gold
     
-    for i in range(gold_cpu.shape[0]):  # predict counts
+    # 收集有效样本
+    for i in range(gold_cpu.shape[0]):
         if gold_cpu[i] != Constants.PAD:
             scores_len += 1.0
-            # 直接添加CPU张量到列表
-            y_prob.append(pred_cpu[i].numpy())
-            y.append(gold_cpu[i].item())
+            if isinstance(pred_cpu, torch.Tensor):
+                y_prob.append(pred_cpu[i].numpy())
+            else:
+                y_prob.append(pred_cpu[i])
+            y.append(gold_cpu[i].item() if isinstance(gold_cpu, torch.Tensor) else gold_cpu[i])
     
     scores = {}
     
@@ -182,18 +197,21 @@ def portfolio(pred, gold, k_list=[10,50,100]):
             scores['map@' + str(k)] = 0.0
         return scores, 0.0
     
-    # 计算指标 - 不再需要在这里转换张量，因为y_prob和y已经是numpy数组和Python数值
+    # 计算hits@k和map@k指标
     for k in k_list:
         try:
             hits = []
             maps = []
             for prob, truth in zip(y_prob, y):
-                hits.append(1.0 if truth in np.argsort(prob)[-k:][::-1] else 0.0)
+                # 计算hits@k
+                hit = hits_k(prob, truth, k)
+                hits.append(hit)
                 
-                # 计算AP@k
-                top_indices = np.argsort(prob)[-k:][::-1].tolist()
-                maps.append(apk([truth], top_indices, k=k))
+                # 计算map@k
+                ap = mapk(prob, truth, k)
+                maps.append(ap)
             
+            # 计算平均值
             scores['hits@' + str(k)] = sum(hits) / len(hits)
             scores['map@' + str(k)] = sum(maps) / len(maps)
         except Exception as e:

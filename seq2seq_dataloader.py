@@ -1,3 +1,8 @@
+"""
+序列到序列数据加载器
+处理社交网络信息扩散预测任务的数据
+"""
+
 import random
 import numpy as np
 import torch
@@ -7,13 +12,99 @@ import pickle
 import scipy.sparse as sp
 import gc
 import os
+import time
 
-from utils.graph_utils import normalize, sparse_mx_to_torch_sparse_tensor, construct_hypergraph
+def normalize(mx):
+    """行归一化稀疏矩阵"""
+    rowsum = np.array(mx.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = sp.diags(r_inv)
+    mx = r_mat_inv.dot(mx)
+    return mx
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    """将scipy稀疏矩阵转换为torch稀疏张量"""
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+
+def construct_hypergraph(cascades, user_size, window_size=5):
+    """
+    构建社交网络超图
+    
+    参数:
+        cascades: 级联列表
+        user_size: 用户总数
+        window_size: 滑动窗口大小
+    
+    返回:
+        HG_Item: 节点-超边矩阵
+        HG_User: 节点-节点矩阵
+    """
+    print("构建社交网络超图...")
+    
+    # 构建超图矩阵（节点-超边）
+    HG_data = []  # 非零元素值
+    HG_row = []   # 行索引
+    HG_col = []   # 列索引
+    
+    edge_count = 0
+    
+    # 为每个级联创建超边
+    for i, cascade in enumerate(cascades):
+        if len(cascade) < 2:
+            continue
+            
+        # 使用滑动窗口创建超边
+        for j in range(len(cascade) - 1):
+            # 创建基于窗口的超边
+            end = min(j + window_size, len(cascade))
+            if end - j < 2:  # 至少需要2个节点
+                continue
+                
+            # 窗口内节点形成一个超边
+            current_window = cascade[j:end]
+            
+            # 将节点与超边相连
+            for node in current_window:
+                if node < user_size:  # 确保节点索引有效
+                    HG_row.append(node)       # 节点索引
+                    HG_col.append(edge_count) # 超边索引
+                    HG_data.append(1.0)       # 边权重
+            
+            edge_count += 1
+            
+            if edge_count % 10000 == 0:
+                print(f"已处理 {edge_count} 个超边")
+    
+    # 构建节点-超边矩阵
+    HG_Item = sp.csr_matrix((HG_data, (HG_row, HG_col)), shape=(user_size, edge_count))
+    
+    # 计算节点-节点关联矩阵 H*H^T
+    HG_User = HG_Item.dot(HG_Item.transpose())
+    
+    # 对角线元素设为0（消除自环）
+    HG_User.setdiag(0)
+    
+    # 归一化
+    HG_User = normalize(HG_User)
+    
+    # 转换为PyTorch稀疏张量
+    HG_Item_tensor = sparse_mx_to_torch_sparse_tensor(HG_Item)
+    HG_User_tensor = sparse_mx_to_torch_sparse_tensor(HG_User)
+    
+    print(f"超图构建完成，共有 {edge_count} 个超边")
+    
+    return HG_Item_tensor, HG_User_tensor
 
 class Seq2SeqDataLoader:
-    """序列到序列数据加载器"""
+    """序列到序列数据加载器，处理社交网络信息扩散预测任务的数据"""
     
-    def __init__(self, data_name, split_ratio=0.5, batch_size=32, cuda=True, shuffle=True, loadNE=True, max_seq_length=500):
+    def __init__(self, data_name, split_ratio=0.7, batch_size=32, cuda=True, shuffle=True, loadNE=True, max_seq_length=100):
         """
         初始化数据加载器
         
@@ -37,13 +128,13 @@ class Seq2SeqDataLoader:
         print(f"数据加载器CUDA设置: {self.cuda}")
         
         # 文件路径
-        self.train_data_path = f'data/{data_name}/cascade.txt'
+        self.train_data_path = f'data/{data_name}/cascadetrain.txt'
         self.valid_data_path = f'data/{data_name}/cascadevalid.txt'
         self.test_data_path = f'data/{data_name}/cascadetest.txt'
         self.u2idx_dict_path = f'data/{data_name}/u2idx.pickle'
         self.idx2u_dict_path = f'data/{data_name}/idx2u.pickle'
         self.net_data_path = f'data/{data_name}/edges.txt'
-        self.embed_dim = 32  # 减小嵌入维度
+        self.embed_dim = 128  # 默认嵌入维度
         self.embed_file_path = f'data/{data_name}/dw{self.embed_dim}.txt'
         
         # 加载用户索引
@@ -224,14 +315,37 @@ class Seq2SeqDataLoader:
             interval = [0.0]  # 第一个用户的时间间隔为0
             
             for i in range(1, len(ts)):
+                # 计算相对于上一个时间的间隔
                 interval.append(ts[i] - ts[i-1])
             
             intervals.append(interval)
         
         return intervals
     
+    def _normalize_time_intervals(self, intervals):
+        """归一化时间间隔"""
+        normalized_intervals = []
+        
+        for interval in intervals:
+            if not interval:
+                normalized_intervals.append([])
+                continue
+                
+            # 找出最大间隔
+            max_interval = max(interval)
+            if max_interval == 0:
+                # 避免除零错误
+                normalized = interval.copy()
+            else:
+                # 归一化到[0,1]范围
+                normalized = [i/max_interval for i in interval]
+                
+            normalized_intervals.append(normalized)
+            
+        return normalized_intervals
+    
     def _load_network_data(self):
-        """加载社交网络数据，并构建DisenIDP风格的超图"""
+        """加载社交网络数据，构建邻接矩阵和超图"""
         print("加载社交网络数据...")
         
         # 检查网络数据文件是否存在
@@ -285,12 +399,12 @@ class Seq2SeqDataLoader:
         
         print(f"社交网络加载完成，共有 {len(self.adj_dict)} 个有连接的用户，{edge_count} 条边")
         
-        # 构建DisenIDP风格的超图
-        print("构建DisenIDP风格的超图...")
+        # 构建超图
+        print("构建社交网络超图...")
         # 合并所有级联数据用于构建超图
         all_cascades = self.train_cascades + self.valid_cascades + self.test_cascades
         
-        # 使用DisenIDP的超图构建方法
+        # 使用滑动窗口构建超图
         window_size = 5  # 滑动窗口大小
         self.HG_Item, self.HG_User = construct_hypergraph(all_cascades, self.user_size, window_size)
         
@@ -301,17 +415,15 @@ class Seq2SeqDataLoader:
         print("超图构建完成")
         
         # 检查预训练嵌入文件是否存在
-        if not os.path.exists(self.embed_file_path):
+        if os.path.exists(self.embed_file_path):
+            try:
+                self.embeds = self._load_pretrained_embeds()
+                print(f"预训练嵌入加载完成，形状: {self.embeds.shape}")
+            except Exception as e:
+                print(f"加载预训练嵌入失败: {e}")
+                self.embeds = None
+        else:
             print(f"警告: 找不到预训练嵌入文件 {self.embed_file_path}")
-            self.embeds = None
-            return
-        
-        # 加载预训练嵌入
-        try:
-            self.embeds = self._load_pretrained_embeds()
-            print(f"预训练嵌入加载完成，形状: {self.embeds.shape}")
-        except Exception as e:
-            print(f"加载预训练嵌入失败: {e}")
             self.embeds = None
     
     def _load_pretrained_embeds(self):
@@ -330,7 +442,13 @@ class Seq2SeqDataLoader:
                 user = parts[0]
                 if user in self._u2idx:
                     idx = self._u2idx[user]
-                    embeds[idx] = np.array([float(x) for x in parts[1:]])
+                    vector = np.array([float(x) for x in parts[1:]])
+                    
+                    # 确保维度匹配
+                    if len(vector) == self.embed_dim:
+                        embeds[idx] = vector
+                    else:
+                        print(f"警告: 用户 {user} 的嵌入维度 ({len(vector)}) 与预期 ({self.embed_dim}) 不匹配")
         
         return embeds
     
@@ -340,19 +458,19 @@ class Seq2SeqDataLoader:
         
         # 训练批次
         self.train_batches = []
-        for i in range(0, len(self.train_cascades), self.batch_size):
-            # 确保索引有效
-            end_idx = min(i + self.batch_size, len(self.train_cascades))
+        train_shuffled_indices = list(range(len(self.train_cascades)))
+        if self.shuffle:
+            random.shuffle(train_shuffled_indices)
+        
+        for i in range(0, len(train_shuffled_indices), self.batch_size):
+            # 批次索引
+            batch_indices = train_shuffled_indices[i:i+self.batch_size]
             
-            # 确保train_intervals存在且长度匹配
-            if not hasattr(self, 'train_intervals') or len(self.train_intervals) < end_idx:
-                print("警告: train_intervals不存在或长度不匹配，创建默认间隔")
-                self.train_intervals = [self._create_default_intervals(c) for c in self.train_cascades]
+            # 收集批次数据
+            batch_cascades = [self.train_cascades[idx] for idx in batch_indices]
+            batch_intervals = [self.train_intervals[idx] for idx in batch_indices]
             
-            batch = self._create_batch(
-                self.train_cascades[i:end_idx], 
-                self.train_intervals[i:end_idx]
-            )
+            batch = self._create_batch(batch_cascades, batch_intervals)
             if batch is not None:
                 self.train_batches.append(batch)
         
@@ -395,7 +513,13 @@ class Seq2SeqDataLoader:
         print(f"创建了 {len(self.train_batches)} 个训练批次, {len(self.valid_batches)} 个验证批次, {len(self.test_batches)} 个测试批次")
 
     def _create_batch(self, cascades, intervals):
-        """创建单个批次"""
+        """
+        创建单个批次
+        
+        参数:
+            cascades: 级联列表
+            intervals: 时间间隔列表
+        """
         src_seqs = []
         tgt_seqs = []
         src_intervals = []
@@ -411,8 +535,8 @@ class Seq2SeqDataLoader:
                 # 如果时间间隔不足，用1.0填充
                 interval = interval + [1.0] * (len(cascade) - len(interval))
             
-            # 动态分割点 - 使用70%作为输入，但至少保留3个节点作为目标
-            split_point = max(1, min(len(cascade) - 3, int(len(cascade) * 0.7)))
+            # 动态分割点 - 使用split_ratio作为分割比例，但至少保留3个节点作为目标
+            split_point = max(1, min(len(cascade) - 3, int(len(cascade) * self.split_ratio)))
             
             # 创建源序列和目标序列
             src = cascade[:split_point]
@@ -487,6 +611,9 @@ class Seq2SeqDataLoader:
     
     def get_train_batches(self):
         """获取训练批次"""
+        # 每个epoch重新洗牌
+        if self.shuffle:
+            random.shuffle(self.train_batches)
         return self.train_batches
     
     def get_valid_batches(self):
@@ -501,3 +628,11 @@ class Seq2SeqDataLoader:
         """创建默认的时间间隔（如果原始数据中没有时间信息）"""
         # 默认使用均匀间隔
         return [1.0] * len(cascade) 
+    
+    def get_adj_tensor(self):
+        """获取邻接矩阵张量"""
+        return self.adj_tensor
+    
+    def get_hypergraph_tensor(self):
+        """获取超图张量"""
+        return self.HG_User if hasattr(self, 'HG_User') else self.adj_tensor 
