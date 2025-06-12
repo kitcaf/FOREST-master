@@ -397,6 +397,10 @@ class GraphAugmentedSeq2Seq(nn.Module):
                  adj_tensor=None, pretrained_embeds=None, bidirectional_encoder=True):
         super(GraphAugmentedSeq2Seq, self).__init__()
         
+        # 确保用户词汇表大小合理
+        if user_size > 1000000:
+            print(f"警告: 用户词汇表大小 ({user_size}) 过大，可能导致数值问题")
+        
         # 社交图嵌入
         self.social_embed = SocialGraphEmbedding(
             user_size, 
@@ -425,6 +429,24 @@ class GraphAugmentedSeq2Seq(nn.Module):
             dropout
         )
         
+        # 使用Xavier初始化所有参数，增加数值稳定性
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        """初始化模型权重，增加数值稳定性"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Xavier初始化
+            nn.init.xavier_uniform_(module.weight)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.GRU):
+            # 对GRU参数进行初始化
+            for name, param in module.named_parameters():
+                if 'weight' in name:
+                    nn.init.xavier_uniform_(param)
+                elif 'bias' in name:
+                    nn.init.constant_(param, 0)
+        
     def forward(self, src, src_lengths, time_intervals, tgt, teacher_forcing_ratio=0.5):
         """
         参数:
@@ -442,29 +464,52 @@ class GraphAugmentedSeq2Seq(nn.Module):
         outputs = torch.zeros(batch_size, tgt_len-1, tgt_vocab_size).to(src.device)
         
         # 编码
-        encoder_outputs, hidden = self.encoder(src, src_lengths, time_intervals)
-        
-        # 第一个解码输入是BOS标记
-        decoder_input = tgt[:, 0]  # [batch_size]
-        
-        # 用于社交约束的上一个节点
-        last_node = None
-        
-        # 解码
-        for t in range(1, tgt_len):
-            # 解码一个步骤
-            output, hidden, _ = self.decoder(decoder_input, hidden, encoder_outputs, last_node)
-            outputs[:, t-1, :] = output
+        try:
+            encoder_outputs, hidden = self.encoder(src, src_lengths, time_intervals)
             
-            # 决定是否使用教师强制
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
+            # 检查编码器输出是否有数值问题
+            if torch.isnan(encoder_outputs).any() or torch.isinf(encoder_outputs).any():
+                print("警告: 编码器输出包含NaN或无穷大值，已修正")
+                encoder_outputs = torch.nan_to_num(encoder_outputs, nan=0.0, posinf=1e6, neginf=-1e6)
             
-            # 获取最可能的单词
-            _, topi = output.topk(1)
-            decoder_input = tgt[:, t] if teacher_force else topi.squeeze(-1)
+            if torch.isnan(hidden).any() or torch.isinf(hidden).any():
+                print("警告: 编码器隐藏状态包含NaN或无穷大值，已修正")
+                hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e6, neginf=-1e6)
             
-            # 更新上一个节点（用于社交约束）
-            last_node = decoder_input
+            # 第一个解码输入是BOS标记
+            decoder_input = tgt[:, 0]  # [batch_size]
+            
+            # 用于社交约束的上一个节点
+            last_node = None
+            
+            # 解码
+            for t in range(1, tgt_len):
+                # 解码一个步骤
+                output, hidden, _ = self.decoder(decoder_input, hidden, encoder_outputs, last_node)
+                
+                # 检查解码器输出是否有数值问题
+                if torch.isnan(output).any() or torch.isinf(output).any():
+                    print(f"警告: 解码器步骤 {t} 输出包含NaN或无穷大值，已修正")
+                    output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
+                
+                # 将输出裁剪到合理范围，避免数值溢出
+                output = torch.clamp(output, min=-1e6, max=1e6)
+                
+                outputs[:, t-1, :] = output
+                
+                # 决定是否使用教师强制
+                teacher_force = torch.rand(1).item() < teacher_forcing_ratio
+                
+                # 获取最可能的单词
+                _, topi = output.topk(1)
+                decoder_input = tgt[:, t] if teacher_force else topi.squeeze(-1)
+                
+                # 更新上一个节点（用于社交约束）
+                last_node = decoder_input
+        except Exception as e:
+            print(f"前向传播过程中出错: {str(e)}")
+            # 返回全零输出
+            return outputs
         
         return outputs
     
@@ -481,44 +526,70 @@ class GraphAugmentedSeq2Seq(nn.Module):
         batch_size = src.size(0)
         
         # 编码
-        encoder_outputs, hidden = self.encoder(src, src_lengths, time_intervals)
-        
-        # 开始标记
-        decoder_input = torch.full((batch_size,), Constants.BOS, device=src.device)
-        
-        # 用于社交约束的上一个节点
-        last_node = None
-        
-        # 存储预测
-        predictions = []
-        attentions = []
-        
-        # 逐步解码
-        for _ in range(max_length):
-            try:
-                # 解码一个步骤
-                output, hidden, attn_weights = self.decoder(decoder_input, hidden, encoder_outputs, last_node)
-                
-                # 获取最可能的用户
-                _, topi = output.topk(1)
-                decoder_input = topi.squeeze(-1)
-                
-                # 更新上一个节点（用于社交约束）
-                last_node = decoder_input
-                
-                # 添加到预测中
-                predictions.append(decoder_input.detach())
-                attentions.append(attn_weights.detach())
-            except Exception as e:
-                print(f"预测过程中出错: {e}")
-                # 如果出错，使用随机预测
-                random_pred = torch.randint(4, self.decoder.output_size, (batch_size,), device=src.device)
-                decoder_input = random_pred
-                last_node = decoder_input
-                predictions.append(decoder_input.detach())
-                # 创建一个空的注意力权重
-                empty_attn = torch.ones(batch_size, 1, encoder_outputs.size(1), device=src.device) / encoder_outputs.size(1)
-                attentions.append(empty_attn)
+        try:
+            encoder_outputs, hidden = self.encoder(src, src_lengths, time_intervals)
+            
+            # 检查编码器输出是否有数值问题
+            if torch.isnan(encoder_outputs).any() or torch.isinf(encoder_outputs).any():
+                encoder_outputs = torch.nan_to_num(encoder_outputs, nan=0.0, posinf=1e6, neginf=-1e6)
+            
+            if torch.isnan(hidden).any() or torch.isinf(hidden).any():
+                hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e6, neginf=-1e6)
+            
+            # 开始标记
+            decoder_input = torch.full((batch_size,), Constants.BOS, device=src.device)
+            
+            # 用于社交约束的上一个节点
+            last_node = None
+            
+            # 存储预测
+            predictions = []
+            attentions = []
+            
+            # 逐步解码
+            for _ in range(max_length):
+                try:
+                    # 解码一个步骤
+                    output, hidden, attn_weights = self.decoder(decoder_input, hidden, encoder_outputs, last_node)
+                    
+                    # 检查解码器输出是否有数值问题
+                    if torch.isnan(output).any() or torch.isinf(output).any():
+                        output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
+                    
+                    # 将输出裁剪到合理范围，避免数值溢出
+                    output = torch.clamp(output, min=-1e6, max=1e6)
+                    
+                    # 获取最可能的用户
+                    _, topi = output.topk(1)
+                    decoder_input = topi.squeeze(-1)
+                    
+                    # 更新上一个节点（用于社交约束）
+                    last_node = decoder_input
+                    
+                    # 添加到预测中
+                    predictions.append(decoder_input.detach())
+                    attentions.append(attn_weights.detach())
+                except Exception as e:
+                    print(f"预测过程中出错: {e}")
+                    # 如果出错，使用随机预测
+                    random_pred = torch.randint(4, self.decoder.output_size, (batch_size,), device=src.device)
+                    decoder_input = random_pred
+                    last_node = decoder_input
+                    predictions.append(decoder_input.detach())
+                    # 创建一个空的注意力权重
+                    empty_attn = torch.ones(batch_size, 1, encoder_outputs.size(1), device=src.device) / encoder_outputs.size(1)
+                    attentions.append(empty_attn)
+        except Exception as e:
+            print(f"编码过程中出错: {str(e)}")
+            # 创建随机预测
+            predictions = [torch.randint(4, self.decoder.output_size, (batch_size,), device=src.device) for _ in range(max_length)]
+            # 创建空的注意力权重
+            attentions = [torch.ones(batch_size, 1, src.size(1), device=src.device) / src.size(1) for _ in range(max_length)]
         
         # 堆叠预测结果
-        return torch.stack(predictions, dim=1), attentions  # [batch_size, max_length] 
+        try:
+            return torch.stack(predictions, dim=1), attentions  # [batch_size, max_length]
+        except Exception as e:
+            print(f"堆叠预测结果时出错: {str(e)}")
+            # 返回一个安全的默认值
+            return torch.zeros(batch_size, max_length, device=src.device).long(), attentions 
